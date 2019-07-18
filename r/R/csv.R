@@ -66,39 +66,34 @@ read_delim_arrow <- function(file,
                              quote = '"',
                              escape_double = TRUE,
                              escape_backslash = FALSE,
-                             # col_names = TRUE,
+                             col_names = TRUE,
                              # col_types = TRUE,
                              col_select = NULL,
                              # na = c("", "NA"),
                              # quoted_na = TRUE,
                              skip_empty_rows = TRUE,
-                             # skip = 0L,
+                             skip = 0L,
                              parse_options = NULL,
                              convert_options = NULL,
-                             read_options = csv_read_options(),
+                             read_options = NULL,
                              as_tibble = TRUE) {
 
-  # These are hardcoded pending https://issues.apache.org/jira/browse/ARROW-5747
-  col_names <- TRUE
-  skip <- 0L
-
   if (is.null(parse_options)) {
-    if (isTRUE(col_names)) {
-      # Add one row to skip, to match arrow's header_rows
-      skip <- skip + 1L
-      # Note that with the hardcoding, header_rows is always 1, which
-      # turns out to be the only value that works meaningfully
+    if (isFALSE(col_names)) {
+      stop("Not implemented", call.=FALSE)
     }
     parse_options <- readr_to_csv_parse_options(
       delim,
       quote,
       escape_double,
       escape_backslash,
-      skip_empty_rows,
-      skip
+      skip_empty_rows
     )
   }
 
+  if (is.null(read_options)) {
+    read_options <- csv_read_options(skip_rows = skip)
+  }
   if (is.null(convert_options)) {
     # TODO:
     # * na strings (needs wiring in csv_convert_options)
@@ -117,10 +112,6 @@ read_delim_arrow <- function(file,
   )
 
   tab <- reader$Read()$select(!!enquo(col_select))
-  if (is.character(col_names)) {
-    # TODO: Rename `tab`'s columns
-    # See https://github.com/apache/arrow/pull/4557
-  }
 
   if (isTRUE(as_tibble)) {
     tab <- as.data.frame(tab)
@@ -135,16 +126,16 @@ read_csv_arrow <- function(file,
                            quote = '"',
                            escape_double = TRUE,
                            escape_backslash = FALSE,
-                           # col_names = TRUE,
+                           col_names = TRUE,
                            # col_types = TRUE,
                            col_select = NULL,
                            # na = c("", "NA"),
                            # quoted_na = TRUE,
                            skip_empty_rows = TRUE,
-                           # skip = 0L,
+                           skip = 0L,
                            parse_options = NULL,
                            convert_options = NULL,
-                           read_options = csv_read_options(),
+                           read_options = NULL,
                            as_tibble = TRUE) {
 
   mc <- match.call()
@@ -159,16 +150,16 @@ read_tsv_arrow <- function(file,
                            quote = '"',
                            escape_double = TRUE,
                            escape_backslash = FALSE,
-                           # col_names = TRUE,
+                           col_names = TRUE,
                            # col_types = TRUE,
                            col_select = NULL,
                            # na = c("", "NA"),
                            # quoted_na = TRUE,
                            skip_empty_rows = TRUE,
-                           # skip = 0L,
+                           skip = 0L,
                            parse_options = NULL,
                            convert_options = NULL,
-                           read_options = csv_read_options(),
+                           read_options = NULL,
                            as_tibble = TRUE) {
 
   mc <- match.call()
@@ -196,11 +187,13 @@ read_tsv_arrow <- function(file,
 #'
 #' @export
 csv_read_options <- function(use_threads = option_use_threads(),
-                             block_size = 1048576L) {
+                             block_size = 1048576L,
+                             skip_rows = 0L) {
   shared_ptr(`arrow::csv::ReadOptions`, csv___ReadOptions__initialize(
     list(
       use_threads = use_threads,
-      block_size = block_size
+      block_size = block_size,
+      skip_rows = skip_rows
     )
   ))
 }
@@ -209,8 +202,7 @@ readr_to_csv_parse_options <- function(delim = ",",
                                        quote = '"',
                                        escape_double = TRUE,
                                        escape_backslash = FALSE,
-                                       skip_empty_rows = TRUE,
-                                       skip = 0L) {
+                                       skip_empty_rows = TRUE) {
   # This function translates from the readr argument list to the arrow arg names
   # TODO: validate inputs
   csv_parse_options(
@@ -221,8 +213,7 @@ readr_to_csv_parse_options <- function(delim = ",",
     escaping = escape_backslash,
     escape_char = '\\',
     newlines_in_values = escape_backslash,
-    ignore_empty_lines = skip_empty_rows,
-    header_rows = skip
+    ignore_empty_lines = skip_empty_rows
   )
 }
 
@@ -236,7 +227,7 @@ readr_to_csv_parse_options <- function(delim = ",",
 #' @param escape_char Escaping character (if `escaping` is `TRUE`)
 #' @param newlines_in_values Whether values are allowed to contain CR (`0x0d`) and LF (`0x0a`) characters
 #' @param ignore_empty_lines Whether empty lines are ignored.  If `FALSE`, an empty line represents
-#' @param header_rows Number of header rows to skip (including the first row containing column names)
+#' @param skip_rows Number of header rows to skip
 #'
 #' @export
 csv_parse_options <- function(delimiter = ",",
@@ -246,8 +237,7 @@ csv_parse_options <- function(delimiter = ",",
                               escaping = FALSE,
                               escape_char = '\\',
                               newlines_in_values = FALSE,
-                              ignore_empty_lines = TRUE,
-                              header_rows = 1L) {
+                              ignore_empty_lines = TRUE) {
 
   shared_ptr(`arrow::csv::ParseOptions`, csv___ParseOptions__initialize(
     list(
@@ -258,8 +248,7 @@ csv_parse_options <- function(delimiter = ",",
       escaping = escaping,
       escape_char = escape_char,
       newlines_in_values = newlines_in_values,
-      ignore_empty_lines = ignore_empty_lines,
-      header_rows = header_rows
+      ignore_empty_lines = ignore_empty_lines
     )
   ))
 }

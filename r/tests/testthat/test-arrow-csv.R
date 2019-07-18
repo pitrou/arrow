@@ -94,7 +94,6 @@ test_that("read_csv_arrow parsing options: col_names", {
 })
 
 test_that("read_csv_arrow parsing options: skip", {
-  skip("Invalid: Empty CSV file")
   tf <- tempfile()
   on.exit(unlink(tf))
 
