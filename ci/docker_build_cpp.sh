@@ -28,6 +28,11 @@ export CCACHE_COMPILERCHECK=content
 export CCACHE_DIR=/build/ccache
 export PATH=/usr/lib/ccache/:$PATH
 
+echo "==="
+echo "=== ccache stats (before build)"
+echo "==="
+ccache -s
+
 rm -rf ${build_dir}
 mkdir -p ${build_dir}
 pushd ${build_dir}
@@ -78,5 +83,10 @@ cmake -GNinja \
 
 ninja
 ninja install
+
+echo "==="
+echo "=== ccache stats (after build)"
+echo "==="
+ccache -s
 
 popd

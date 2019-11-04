@@ -31,6 +31,7 @@ jobs:
         include:
           - label: C++ w/ clang-7 & system packages
             image: cpp-system-deps
+            cache_kind: cpp
             skip_expression: |
               ${ARROW_CI_CPP_AFFECTED} != "1"
           - label: Rust
@@ -47,6 +48,14 @@ jobs:
       - uses: actions/checkout@master
         with:
           submodules: true
+
+      - uses: actions/cache@preview
+        name: Cache ccache
+        if: matrix.cache_kind == 'cpp'
+        with:
+          path: ~/.ccache
+          key: ${{ runner.os }}-${{ matrix.image }}
+
       - name: docker-compose
         run: |
           eval "$(python ci/detect-changes.py)"
