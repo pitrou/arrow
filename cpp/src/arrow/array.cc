@@ -587,6 +587,12 @@ Result<std::shared_ptr<StructArray>> StructArray::Make(
   if (offset > length) {
     return Status::IndexError("Offset greater than length of child arrays");
   }
+  if (null_bitmap == nullptr) {
+    if (null_count > 0) {
+      return Status::Invalid("null_count = ", null_count, " but no null bitmap given");
+    }
+    null_count = 0;
+  }
   return std::make_shared<StructArray>(struct_(fields), length - offset, children,
                                        null_bitmap, null_count, offset);
 }
@@ -1322,9 +1328,13 @@ struct ValidateVisitor {
     if (array.length() && !value_offsets) {
       return Status::Invalid("value_offsets_ was null");
     }
-    if (value_offsets->size() / static_cast<int>(sizeof(offset_type)) < array.length()) {
-      return Status::Invalid("offset buffer size (bytes): ", value_offsets->size(),
-                             " isn't large enough for length: ", array.length());
+    if (array.length() > 0) {
+      // For length 0, an empty offsets array seems accepted as a special case (ARROW-544)
+      if (value_offsets->size() / static_cast<int>(sizeof(offset_type)) <
+          array.length() + 1) {
+        return Status::Invalid("offset buffer size (bytes): ", value_offsets->size(),
+                               " isn't large enough for length: ", array.length());
+      }
     }
 
     auto prev_offset = array.value_offset(0);

@@ -15,15 +15,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-cffi
-cython=0.29.7
-cloudpickle
-hypothesis
-numpy>=1.14
-pandas
-pytest
-pytest-faulthandler
-pytest-lazy-fixture
-pytz
-setuptools
-setuptools_scm=3.2.0
+add_arrow_test(bridge_test PREFIX "arrow-c")
+
+arrow_install_all_headers("arrow/c")

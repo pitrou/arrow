@@ -108,6 +108,7 @@ set(ARROW_SRCS
     tensor.cc
     type.cc
     visitor.cc
+    c/bridge.cc
     csv/converter.cc
     csv/chunker.cc
     csv/column_builder.cc
@@ -224,6 +225,7 @@ add_subdirectory(testing)
 #
 
 add_subdirectory(array)
+add_subdirectory(c)
 add_subdirectory(csv)
 add_subdirectory(io)
 add_subdirectory(util)
