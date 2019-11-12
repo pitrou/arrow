@@ -42,6 +42,15 @@
   invisible()
 }
 
+#' @importFrom vctrs s3_register
+.onLoad <- function(...) {
+  s3_register("reticulate::py_to_r", "pyarrow.lib.Array")
+  s3_register("reticulate::py_to_r", "pyarrow.lib.RecordBatch")
+  s3_register("reticulate::r_to_py", "Array")
+  s3_register("reticulate::r_to_py", "RecordBatch")
+  invisible()
+}
+
 #' Is the C++ Arrow library available?
 #'
 #' You won't generally need to call this function, but it's here in case it

@@ -15,16 +15,29 @@
 # specific language governing permissions and limitations
 # under the License.
 
-skip_if_not_available <- function(feature) {
-  # This is currently for compression only but we can extend to other features
-  if (!codec_is_available(feature)) {
-    skip(paste("Arrow C++ not built with support for", feature))
-  }
-}
+context("To/from Python")
 
-skip_if_no_pyarrow <- function() {
-  skip_if_not_installed("reticulate")
-  if (!reticulate::py_module_available("pyarrow")) {
-    skip("pyarrow not available for testing")
-  }
-}
+test_that("Array from Python", {
+  skip_if_no_pyarrow()
+  pa <- reticulate::import("pyarrow")
+  py <- pa$array(c(1, 2, 3))
+  expect_equal(py, Array$create(c(1, 2, 3)))
+})
+
+test_that("Array to Python", {
+  skip_if_no_pyarrow()
+  pa <- reticulate::import("pyarrow", convert=FALSE)
+  r <- Array$create(c(1, 2, 3))
+  py <- pa$concat_arrays(list(r))
+  expect_is(py, "pyarrow.lib.Array")
+  expect_equal(reticulate::py_to_r(py), r)
+})
+
+test_that("RecordBatch to/from Python", {
+  skip_if_no_pyarrow()
+  pa <- reticulate::import("pyarrow", convert=FALSE)
+  batch <- record_batch(col1=c(1, 2, 3), col2=letters[1:3])
+  py <- reticulate::r_to_py(batch)
+  expect_is(py, "pyarrow.lib.RecordBatch")
+  expect_equal(reticulate::py_to_r(py), batch)
+})
