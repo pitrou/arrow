@@ -169,85 +169,50 @@ TEST_F(TestLRUCache, Eviction) {
   ASSERT_EQ(Find(102), nullptr);
 }
 
-struct Callable {
-  int num_calls = 0;
+TEST(TestMemoizeLRU, Basics) {
+  for (bool thread_safe : {true, false}) {
+    int num_calls = 0;
+    auto fn = [&num_calls](const std::string& s) {
+      ++num_calls;
+      return IntValue{std::stoi(s)};
+    };
 
-  IntValue operator()(const std::string& s) {
-    ++num_calls;
-    return IntValue{std::stoi(s)};
-  }
-};
-
-struct MemoizeLRUFactory {
-  template <typename Func,
-            typename RetType = decltype(MemoizeLRU(std::declval<Func>(), 0))>
-  RetType operator()(Func&& func, int32_t capacity) {
-    return MemoizeLRU(std::forward<Func>(func), capacity);
-  }
-};
-
-struct MemoizeLRUThreadUnsafeFactory {
-  template <typename Func,
-            typename RetType = decltype(MemoizeLRUThreadUnsafe(std::declval<Func>(), 0))>
-  RetType operator()(Func&& func, int32_t capacity) {
-    return MemoizeLRUThreadUnsafe(std::forward<Func>(func), capacity);
-  }
-};
-
-template <typename T>
-class TestMemoizeLRU : public ::testing::Test {
- public:
-  using K = std::string;
-  using V = IntValue;
-  using MemoizerFactory = T;
-
-  K MakeKey(int num) { return std::to_string(num); }
-
-  void TestBasics() {
-    using V = IntValue;
-    Callable c;
-
-    auto mem = factory_(c, 5);
+    auto mem =
+        thread_safe
+            ? MemoizeLRU(fn, 5)
+            : std::function<IntValue(const std::string&)>(MemoizeLRUThreadUnsafe(fn, 5));
 
     // Cache fills
     for (int i = 0; i < 5; ++i) {
-      ASSERT_EQ(mem(MakeKey(i)), V{i});
+      ASSERT_EQ(mem(std::to_string(i)), IntValue{i});
     }
-    ASSERT_EQ(c.num_calls, 5);
+    ASSERT_EQ(num_calls, 5);
 
     // Cache hits
     for (int i : {1, 3, 4, 0, 2}) {
-      ASSERT_EQ(mem(MakeKey(i)), V{i});
+      ASSERT_EQ(mem(std::to_string(i)), IntValue{i});
     }
-    ASSERT_EQ(c.num_calls, 5);
+    ASSERT_EQ(num_calls, 5);
 
     // Calling with other inputs will cause evictions
     for (int i = 5; i < 8; ++i) {
-      ASSERT_EQ(mem(MakeKey(i)), V{i});
+      ASSERT_EQ(mem(std::to_string(i)), IntValue{i});
     }
-    ASSERT_EQ(c.num_calls, 8);
+    ASSERT_EQ(num_calls, 8);
+
     // Hits
     for (int i : {0, 2, 5, 6, 7}) {
-      ASSERT_EQ(mem(MakeKey(i)), V{i});
+      ASSERT_EQ(mem(std::to_string(i)), IntValue{i});
     }
-    ASSERT_EQ(c.num_calls, 8);
+    ASSERT_EQ(num_calls, 8);
+
     // Misses
     for (int i : {1, 3, 4}) {
-      ASSERT_EQ(mem(MakeKey(i)), V{i});
+      ASSERT_EQ(mem(std::to_string(i)), IntValue{i});
     }
-    ASSERT_EQ(c.num_calls, 11);
+    ASSERT_EQ(num_calls, 11);
   }
-
- protected:
-  MemoizeLRUFactory factory_;
-};
-
-using MemoizeLRUTestTypes =
-    ::testing::Types<MemoizeLRUFactory, MemoizeLRUThreadUnsafeFactory>;
-
-TYPED_TEST_SUITE(TestMemoizeLRU, MemoizeLRUTestTypes);
-
-TYPED_TEST(TestMemoizeLRU, Basics) { this->TestBasics(); }
+}
 
 }  // namespace internal
 }  // namespace arrow

@@ -118,15 +118,13 @@ template <typename Key, typename Value, typename Cache, typename Func>
 struct ThreadSafeMemoizer {
   using RetType = Value;
 
-  template <typename F>
-  ThreadSafeMemoizer(F&& func, int32_t cache_capacity)
-      : mutex_(new std::mutex), func_(std::forward<F>(func)), cache_(cache_capacity) {}
+  ThreadSafeMemoizer(Func func, int32_t cache_capacity)
+      : func_(std::move(func)), cache_(cache_capacity) {}
 
   // The memoizer can't return a pointer to the cached value, because
   // the cache entry may be evicted by another thread.
-
   Value operator()(const Key& key) {
-    std::unique_lock<std::mutex> lock(*mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     const Value* value_ptr;
     value_ptr = cache_.Find(key);
     if (ARROW_PREDICT_TRUE(value_ptr != NULLPTR)) {
@@ -139,7 +137,7 @@ struct ThreadSafeMemoizer {
   }
 
  private:
-  std::unique_ptr<std::mutex> mutex_;
+  std::mutex mutex_;
   Func func_;
   Cache cache_;
 };
@@ -148,10 +146,8 @@ template <typename Key, typename Value, typename Cache, typename Func>
 struct ThreadUnsafeMemoizer {
   using RetType = const Value&;
 
-  template <typename F>
-  ThreadUnsafeMemoizer(F&& func, int32_t cache_capacity)
-      : /*mutex_(new std::mutex), */ func_(std::forward<F>(func)),
-        cache_(cache_capacity) {}
+  ThreadUnsafeMemoizer(Func func, int32_t cache_capacity)
+      : func_(std::move(func)), cache_(cache_capacity) {}
 
   const Value& operator()(const Key& key) {
     const Value* value_ptr;
@@ -167,31 +163,20 @@ struct ThreadUnsafeMemoizer {
   Cache cache_;
 };
 
-// A copy-constructible callable wrapper, for std::function<>
-
-template <typename Callable, typename RetType = call_traits::return_type<Callable>,
-          typename Value = call_traits::argument_type<0, Callable>>
-struct SharedCallable {
-  explicit SharedCallable(Callable callable)
-      : callable_(std::make_shared<Callable>(std::move(callable))) {}
-
-  template <typename V>
-  RetType operator()(V&& v) {
-    return (*callable_)(std::forward<V>(v));
-  }
-
- private:
-  const std::shared_ptr<Callable> callable_;
-};
-
 template <template <typename...> class Cache,
           template <typename...> class MemoizerType = ThreadSafeMemoizer, typename Func,
           typename Key = typename std::decay<call_traits::argument_type<0, Func>>::type,
           typename Value = typename std::decay<call_traits::return_type<Func>>::type,
           typename Memoizer = MemoizerType<Key, Value, Cache<Key, Value>, Func>,
-          typename RetFunc = std::function<typename Memoizer::RetType(const Key&)>>
-static RetFunc Memoize(Func&& func, int32_t cache_capacity) {
-  return SharedCallable<Memoizer>(Memoizer(std::forward<Func>(func), cache_capacity));
+          typename RetType = typename Memoizer::RetType>
+static std::function<RetType(const Key&)> Memoize(Func func, int32_t cache_capacity) {
+  // std::function<> requires copy constructibility
+  struct {
+    RetType operator()(const Key& key) const { return (*memoized_)(key); }
+    std::shared_ptr<Memoizer> memoized_;
+  } shared_memoized = {std::make_shared<Memoizer>(std::move(func), cache_capacity)};
+
+  return shared_memoized;
 }
 
 // template <template <typename K, typename V> class Cache,
@@ -210,9 +195,9 @@ static RetFunc Memoize(Func&& func, int32_t cache_capacity) {
 }  // namespace detail
 
 // Apply a LRU memoization cache to a callable.
-template <typename Func,
-          typename RetFunc = decltype(detail::Memoize<LRUCache>(std::declval<Func>(), 0))>
-static RetFunc MemoizeLRU(Func&& func, int32_t cache_capacity) {
+template <typename Func>
+static auto MemoizeLRU(Func&& func, int32_t cache_capacity)
+    -> decltype(detail::Memoize<LRUCache>(std::forward<Func>(func), cache_capacity)) {
   return detail::Memoize<LRUCache>(std::forward<Func>(func), cache_capacity);
 }
 
@@ -220,10 +205,10 @@ static RetFunc MemoizeLRU(Func&& func, int32_t cache_capacity) {
 // lookups (more than 2x faster), but you'll have to manage thread safety yourself.
 // A recommended usage is to declare per-thread caches using `thread_local`
 // (see cache_benchmark.cc).
-template <typename Func, typename RetFunc = decltype(
-                             detail::Memoize<LRUCache, detail::ThreadUnsafeMemoizer>(
-                                 std::declval<Func>(), 0))>
-static RetFunc MemoizeLRUThreadUnsafe(Func&& func, int32_t cache_capacity) {
+template <typename Func>
+static auto MemoizeLRUThreadUnsafe(Func&& func, int32_t cache_capacity)
+    -> decltype(detail::Memoize<LRUCache, detail::ThreadUnsafeMemoizer>(
+        std::forward<Func>(func), cache_capacity)) {
   return detail::Memoize<LRUCache, detail::ThreadUnsafeMemoizer>(std::forward<Func>(func),
                                                                  cache_capacity);
 }
