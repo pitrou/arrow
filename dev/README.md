@@ -40,15 +40,12 @@ git remote add apache git@github.com:apache/arrow.git
 run the following command
 
 ```
-dev/merge_arrow_pr.py
+./dev/merge_arrow_pr.sh
 ```
 
-This script uses requests and jira libraries.  Before running this script,
-run the following command to prepare them:
-
-```
-pip install requests jira
-```
+This installs a new Python `venv` under `dev/.venv[PY_VERSION]` and all the necessary
+dependencies to run archery's tool to merge PRs consistently. After installed,
+it runs the tool.
 
 This uses the GitHub REST API; if you encounter rate limit issues, you may set
 a `ARROW_GITHUB_API_TOKEN` environment variable to use a Personal Access Token.
