@@ -25,6 +25,12 @@ ARG node=14
 ARG jdk=8
 ARG go=1.15
 
+# Uninstall unused space-consuming packages
+# (XXX: it would be better not to install them, but they are used by other
+#  builds which are also based on conda-cpp)
+RUN conda uninstall -q clangdev llvmdev valgrind
+
+# Install Archery and integration dependencies
 COPY ci/conda_env_archery.yml /arrow/ci/
 RUN conda install -q \
         --file arrow/ci/conda_env_archery.yml \
@@ -32,25 +38,14 @@ RUN conda install -q \
         maven=${maven} \
         nodejs=${node} \
         openjdk=${jdk} && \
-    conda clean --all
+    conda clean --all --force-pkgs-dirs
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+# Install Rust and remove space-consuming docs
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
+    rm -rf `find /root/.rustup/ -name html -type d`
 
 ENV GOROOT=/opt/go \
     GOBIN=/opt/go/bin \
     GOPATH=/go \
     PATH=/opt/go/bin:$PATH
 RUN wget -nv -O - https://dl.google.com/go/go${go}.linux-${arch}.tar.gz | tar -xzf - -C /opt
-
-ENV ARROW_BUILD_INTEGRATION=ON \
-    ARROW_BUILD_TESTS=OFF \
-    ARROW_FLIGHT=ON \
-    ARROW_ORC=OFF \
-    ARROW_DATASET=OFF \
-    ARROW_GANDIVA=OFF \
-    ARROW_PLASMA=OFF \
-    ARROW_FILESYSTEM=OFF \
-    ARROW_HDFS=OFF \
-    ARROW_JEMALLOC=OFF \
-    ARROW_JSON=OFF \
-    ARROW_USE_GLOG=OFF
