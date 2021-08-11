@@ -586,10 +586,14 @@ struct MoveOnlyDataType {
 
   int ToInt() const { return data == nullptr ? -42 : *data; }
 
-  bool operator==(int other) const { return data != nullptr && *data == other; }
   bool operator==(const MoveOnlyDataType& other) const {
     return data != nullptr && other.data != nullptr && *data == *other.data;
   }
+  bool operator<(const MoveOnlyDataType& other) const {
+    return data == nullptr || (other.data != nullptr && *data < *other.data);
+  }
+
+  bool operator==(int other) const { return data != nullptr && *data == other; }
   friend bool operator==(int left, const MoveOnlyDataType& right) {
     return right == left;
   }
