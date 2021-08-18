@@ -18,12 +18,12 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstddef>
 #include <initializer_list>
 #include <iterator>
 #include <limits>
-#include <new>
 #include <type_traits>
 #include <utility>
 
@@ -33,50 +33,17 @@
 namespace arrow {
 namespace internal {
 
-template <typename T>
-struct StaticVectorMixin {
-  // properly aligned uninitialized storage for N T's
-  using storage_type = typename std::aligned_storage<sizeof(T), alignof(T)>::type;
-
-  static T* ptr_at(storage_type* p, size_t i) {
-    return launder(reinterpret_cast<T*>(&p[i]));
-  }
-
-  static constexpr const T* ptr_at(const storage_type* p, size_t i) {
-    return launder(reinterpret_cast<const T*>(&p[i]));
-  }
-
-  static void move_storage(storage_type* src, storage_type* dest, size_t n) {
-    for (size_t i = 0; i < n; ++i) {
-      T* src_item = ptr_at(src, i);
-      T* dest_item = ptr_at(dest, i);
-      new (dest_item) T(std::move(*src_item));
-      src_item->~T();
-    }
-  }
-
-  static void destroy_storage(storage_type* p, size_t n) {
-    for (size_t i = 0; i < n; ++i) {
-      ptr_at(p, i)->~T();
-    }
-  }
-};
-
 template <typename T, size_t N, bool NonTrivialDestructor>
-struct StaticVectorStorageBase : public StaticVectorMixin<T> {
-  using typename StaticVectorMixin<T>::storage_type;
-
-  storage_type static_data_[N];
+struct StaticVectorStorageBase {
+  std::array<Storage<T>, N> static_data_;
   size_t size_ = 0;
 
   void destroy() {}
 };
 
 template <typename T, size_t N>
-struct StaticVectorStorageBase<T, N, true> : public StaticVectorMixin<T> {
-  using typename StaticVectorMixin<T>::storage_type;
-
-  storage_type static_data_[N];
+struct StaticVectorStorageBase<T, N, true> {
+  std::array<Storage<T>, N> static_data_;
   size_t size_ = 0;
 
   ~StaticVectorStorageBase() noexcept { destroy(); }
@@ -87,16 +54,14 @@ struct StaticVectorStorageBase<T, N, true> : public StaticVectorMixin<T> {
 template <typename T, size_t N, bool D = !std::is_trivially_destructible<T>::value>
 struct StaticVectorStorage : public StaticVectorStorageBase<T, N, D> {
   using Base = StaticVectorStorageBase<T, N, D>;
-  using typename Base::storage_type;
-
   using Base::size_;
   using Base::static_data_;
 
   StaticVectorStorage() noexcept = default;
 
-  T* data_ptr() { return this->ptr_at(static_data_, 0); }
+  T* data_ptr() { return static_data_.front().get(); }
 
-  constexpr const T* const_data_ptr() const { return this->ptr_at(static_data_, 0); }
+  constexpr const T* const_data_ptr() const { return static_data_.front().get(); }
 
   // Adjust storage size, but don't initialize any objects
   void bump_size(size_t addend) {
@@ -117,8 +82,17 @@ struct StaticVectorStorage : public StaticVectorStorageBase<T, N, D> {
   // You need to call destroy() first if necessary (e.g. in a
   // move assignment operator).
   void move_from(StaticVectorStorage&& other) noexcept {
+    // destroy any active objects
+    for (size_t i = 0; i < size_; ++i) {
+      static_data_[i].Destroy();
+    }
+
+    // move objects from other into this
+    for (size_t i = 0; i < other.size_; ++i) {
+      static_data_[i].Construct(other.static_data_[i].Move());
+    }
+
     size_ = other.size_;
-    this->move_storage(other.static_data_, static_data_, size_);
     other.size_ = 0;
   }
 

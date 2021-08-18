@@ -18,6 +18,7 @@
 #pragma once
 
 #include <new>
+#include <type_traits>
 
 namespace arrow {
 namespace internal {
@@ -30,6 +31,28 @@ constexpr T* launder(T* p) noexcept {
   return p;
 }
 #endif
+
+template <typename T>
+struct Storage {
+  T* get() { return launder(reinterpret_cast<T*>(&data_)); }
+
+  constexpr const T* get() const { return launder(reinterpret_cast<const T*>(&data_)); }
+
+  void Destroy() { get()->~T(); }
+
+  template <typename... A>
+  void Construct(A&&... args) {
+    new (&data_) T(std::forward<A>(args)...);
+  }
+
+  T Move() {
+    T out = std::move(*get());
+    Destroy();
+    return out;
+  }
+
+  typename std::aligned_storage<sizeof(T), alignof(T)>::type data_;
+};
 
 }  // namespace internal
 }  // namespace arrow
