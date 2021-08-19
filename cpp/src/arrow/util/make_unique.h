@@ -35,6 +35,7 @@ typename std::enable_if<std::is_array<T>::value && std::extent<T>::value == 0,
                         std::unique_ptr<T>>::type
 make_unique(std::size_t n) {
   using value_type = typename std::remove_extent<T>::type;
+  // NOLINTNEXTLINE modernize-avoid-c-arrays
   return std::unique_ptr<value_type[]>(new value_type[n]);
 }
 

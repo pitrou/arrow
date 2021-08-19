@@ -160,7 +160,7 @@ class ARROW_MUST_USE_TYPE Result : public util::EqualityComparable<Result<T>> {
                                   typename std::remove_cv<U>::type>::type,
                               Status>::value>::type>
   Result(U&& value) noexcept {  // NOLINT(runtime/explicit)
-    ConstructValue(std::forward<U>(value));
+    data_.Construct(std::forward<U>(value));
   }
 
   /// Constructs a Result object that contains `value`. The resulting object
@@ -175,7 +175,7 @@ class ARROW_MUST_USE_TYPE Result : public util::EqualityComparable<Result<T>> {
   // NOTE `Result(U&& value)` above should be sufficient, but some compilers
   // fail matching it.
   Result(T&& value) noexcept {  // NOLINT(runtime/explicit)
-    ConstructValue(std::move(value));
+    data_.Construct(std::move(value));
   }
 
   /// Copy constructor.
@@ -190,7 +190,7 @@ class ARROW_MUST_USE_TYPE Result : public util::EqualityComparable<Result<T>> {
   /// \param other The value to copy from.
   Result(const Result& other) : status_(other.status_) {
     if (ARROW_PREDICT_TRUE(status_.ok())) {
-      ConstructValue(other.ValueUnsafe());
+      data_.Construct(other.ValueUnsafe());
     }
   }
 
@@ -205,7 +205,7 @@ class ARROW_MUST_USE_TYPE Result : public util::EqualityComparable<Result<T>> {
                             std::is_convertible<U, T>::value>::type>
   Result(const Result<U>& other) : status_(other.status_) {
     if (ARROW_PREDICT_TRUE(status_.ok())) {
-      ConstructValue(other.ValueUnsafe());
+      data_.Construct(other.ValueUnsafe());
     }
   }
 
@@ -220,7 +220,7 @@ class ARROW_MUST_USE_TYPE Result : public util::EqualityComparable<Result<T>> {
     Destroy();
     status_ = other.status_;
     if (ARROW_PREDICT_TRUE(status_.ok())) {
-      ConstructValue(other.ValueUnsafe());
+      data_.Construct(other.ValueUnsafe());
     }
     return *this;
   }
@@ -239,7 +239,7 @@ class ARROW_MUST_USE_TYPE Result : public util::EqualityComparable<Result<T>> {
   Result(Result<U>&& other) noexcept {
     if (ARROW_PREDICT_TRUE(other.status_.ok())) {
       status_ = std::move(other.status_);
-      ConstructValue(other.MoveValueUnsafe());
+      data_.Construct(other.MoveValueUnsafe());
     } else {
       // If we moved the status, the other status may become ok but the other
       // value hasn't been constructed => crash on other destructor.
@@ -261,7 +261,7 @@ class ARROW_MUST_USE_TYPE Result : public util::EqualityComparable<Result<T>> {
     Destroy();
     if (ARROW_PREDICT_TRUE(other.status_.ok())) {
       status_ = std::move(other.status_);
-      ConstructValue(other.MoveValueUnsafe());
+      data_.Construct(other.MoveValueUnsafe());
     } else {
       // If we moved the status, the other status may become ok but the other
       // value hasn't been constructed => crash on other destructor.
@@ -432,18 +432,13 @@ class ARROW_MUST_USE_TYPE Result : public util::EqualityComparable<Result<T>> {
 
  private:
   Status status_;  // pointer-sized
-  typename std::aligned_storage<sizeof(T), alignof(T)>::type data_;
-
-  template <typename U>
-  void ConstructValue(U&& u) {
-    new (&data_) T(std::forward<U>(u));
-  }
+  internal::AlignedStorage<T> data_;
 
   void Destroy() {
     if (ARROW_PREDICT_TRUE(status_.ok())) {
       static_assert(offsetof(Result<T>, status_) == 0,
                     "Status is guaranteed to be at the start of Result<>");
-      internal::launder(reinterpret_cast<const T*>(&data_))->~T();
+      data_.Destroy();
     }
   }
 };

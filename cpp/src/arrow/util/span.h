@@ -17,6 +17,7 @@
 
 #pragma once
 
+#define span_FEATURE_MAKE_SPAN 1
 #define span_CONFIG_SELECT_SPAN span_SPAN_NONSTD
 
 #include "arrow/vendored/span.hpp"  // IWYU pragma: export
@@ -24,6 +25,7 @@
 namespace arrow {
 namespace util {
 
+using nonstd::make_span;
 using nonstd::span;
 
 }  // namespace util

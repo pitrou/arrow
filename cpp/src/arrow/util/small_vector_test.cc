@@ -37,6 +37,8 @@ namespace internal {
 
 struct HeapInt {
   HeapInt() : HeapInt(0) {}
+  HeapInt(HeapInt&&) = default;
+  HeapInt& operator=(HeapInt&&) = default;
 
   explicit HeapInt(int x) : ptr(new int(x)) {}
 
@@ -62,7 +64,8 @@ struct HeapInt {
   }
 
   bool operator==(int other) const { return ptr != nullptr && *ptr == other; }
-  friend bool operator==(int left, const HeapInt& right) { return right == left; }
+
+  friend void PrintTo(const HeapInt& i, std::ostream* os) { *os << i.ToInt(); }
 
   std::unique_ptr<int> ptr;
 };
@@ -233,11 +236,10 @@ class TestSmallStaticVector : public ::testing::Test {
   void CheckClear(bool expect_overflow) {
     IntVectorType<N> ints = MakeVector<N>({5, 6, 7, 8, 9});
     ASSERT_EQ(ints.size(), 5);
-    size_t capacity = ints.capacity();
 
     ints.clear();
     ASSERT_EQ(ints.size(), 0);
-    ASSERT_EQ(ints.capacity(), capacity);
+    ASSERT_EQ(ints.capacity(), N);  // after clear, capacity == static capacity
     ASSERT_EQ(UsesStaticStorage(ints), !expect_overflow);
   }
 
@@ -412,11 +414,6 @@ class TestSmallStaticVector : public ::testing::Test {
     IntVectorType<N> moved_moved_ints = std::move(moved_ints);
     ASSERT_EQ(moved_moved_ints.size(), 5);
     ASSERT_EQ(moved_ints.size(), 0);
-    EXPECT_THAT(moved_moved_ints, ElementsAre(4, 5, 6, 7, 8));
-
-    // Move into itself
-    moved_moved_ints = std::move(moved_moved_ints);
-    ASSERT_EQ(moved_moved_ints.size(), 5);
     EXPECT_THAT(moved_moved_ints, ElementsAre(4, 5, 6, 7, 8));
   }
 

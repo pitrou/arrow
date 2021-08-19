@@ -33,24 +33,35 @@ constexpr T* launder(T* p) noexcept {
 #endif
 
 template <typename T>
-struct Storage {
+class AlignedStorage {
+ public:
   T* get() { return launder(reinterpret_cast<T*>(&data_)); }
-
   constexpr const T* get() const { return launder(reinterpret_cast<const T*>(&data_)); }
 
-  void Destroy() { get()->~T(); }
+  T& operator*() { return *get(); }
+  constexpr const T& operator*() const { return *get(); }
+
+  T* operator->() { return get(); }
+  constexpr const T* operator->() const { return get(); }
+
+  void Destroy() noexcept {
+    if (!std::is_trivially_destructible<T>::value) {
+      get()->~T();
+    }
+  }
 
   template <typename... A>
   void Construct(A&&... args) {
     new (&data_) T(std::forward<A>(args)...);
   }
 
-  T Move() {
-    T out = std::move(*get());
-    Destroy();
-    return out;
+  void MoveFrom(AlignedStorage* other) noexcept {
+    static_assert(std::is_nothrow_move_constructible<T>::value, "");
+    Construct(std::move(*other->get()));
+    other->Destroy();
   }
 
+ private:
   typename std::aligned_storage<sizeof(T), alignof(T)>::type data_;
 };
 

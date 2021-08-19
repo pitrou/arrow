@@ -561,8 +561,8 @@ struct MoveOnlyDataType {
   MoveOnlyDataType(const MoveOnlyDataType& other) = delete;
   MoveOnlyDataType& operator=(const MoveOnlyDataType& other) = delete;
 
-  MoveOnlyDataType(MoveOnlyDataType&& other) { MoveFrom(&other); }
-  MoveOnlyDataType& operator=(MoveOnlyDataType&& other) {
+  MoveOnlyDataType(MoveOnlyDataType&& other) noexcept { MoveFrom(&other); }
+  MoveOnlyDataType& operator=(MoveOnlyDataType&& other) noexcept {
     MoveFrom(&other);
     return *this;
   }
@@ -577,7 +577,7 @@ struct MoveOnlyDataType {
 
   ~MoveOnlyDataType() { Destroy(); }
 
-  void Destroy() {
+  void Destroy() noexcept {
     if (data != nullptr) {
       delete data;
       data = nullptr;
@@ -585,7 +585,7 @@ struct MoveOnlyDataType {
     }
   }
 
-  void MoveFrom(MoveOnlyDataType* other) {
+  void MoveFrom(MoveOnlyDataType* other) noexcept {
     Destroy();
     data = other->data;
     other->data = nullptr;

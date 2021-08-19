@@ -26,193 +26,203 @@
 #include <limits>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include "arrow/util/launder.h"
 #include "arrow/util/macros.h"
+#include "arrow/util/make_unique.h"
+#include "arrow/util/span.h"
 
 namespace arrow {
 namespace internal {
 
-template <typename T, size_t N, bool NonTrivialDestructor>
-struct StaticVectorStorageBase {
-  std::array<Storage<T>, N> static_data_;
-  size_t size_ = 0;
-
-  void destroy() {}
+template <typename Derived, bool TriviallyDestructible>
+class ConditionallyTriviallyDestructible {
+ protected:
+  ~ConditionallyTriviallyDestructible() { static_cast<Derived*>(this)->destroy(); }
 };
+template <typename Derived>
+class ConditionallyTriviallyDestructible<Derived, true> {};
 
 template <typename T, size_t N>
-struct StaticVectorStorageBase<T, N, true> {
-  std::array<Storage<T>, N> static_data_;
+struct StaticVectorStorage
+    : ConditionallyTriviallyDestructible<StaticVectorStorage<T, N>,
+                                         std::is_trivially_destructible<T>::value> {
+  std::array<AlignedStorage<T>, N> static_data_;
   size_t size_ = 0;
-
-  ~StaticVectorStorageBase() noexcept { destroy(); }
-
-  void destroy() noexcept { this->destroy_storage(static_data_, size_); }
-};
-
-template <typename T, size_t N, bool D = !std::is_trivially_destructible<T>::value>
-struct StaticVectorStorage : public StaticVectorStorageBase<T, N, D> {
-  using Base = StaticVectorStorageBase<T, N, D>;
-  using Base::size_;
-  using Base::static_data_;
 
   StaticVectorStorage() noexcept = default;
 
-  T* data_ptr() { return static_data_.front().get(); }
-
-  constexpr const T* const_data_ptr() const { return static_data_.front().get(); }
-
-  // Adjust storage size, but don't initialize any objects
-  void bump_size(size_t addend) {
-    assert(size_ + addend <= N);
-    size_ += addend;
+  AlignedStorage<T>* data_ptr() { return static_data_.data(); }
+  constexpr const AlignedStorage<T>* const_data_ptr() const {
+    return static_data_.data();
   }
 
-  void ensure_capacity(size_t min_capacity) { assert(min_capacity <= N); }
-
-  // Adjust storage size, but don't destroy any objects
-  void reduce_size(size_t reduce_by) {
-    assert(reduce_by <= size_);
-    size_ -= reduce_by;
-  }
-
-  // Move objects from another storage, but don't destroy any objects currently
-  // stored in *this.
-  // You need to call destroy() first if necessary (e.g. in a
-  // move assignment operator).
-  void move_from(StaticVectorStorage&& other) noexcept {
-    // destroy any active objects
-    for (size_t i = 0; i < size_; ++i) {
-      static_data_[i].Destroy();
-    }
-
-    // move objects from other into this
-    for (size_t i = 0; i < other.size_; ++i) {
-      static_data_[i].Construct(other.static_data_[i].Move());
-    }
-
-    size_ = other.size_;
-    other.size_ = 0;
-  }
+  util::span<AlignedStorage<T>> data_span() { return {data_ptr(), size_}; }
 
   constexpr size_t capacity() const { return N; }
 
   constexpr size_t max_size() const { return N; }
 
-  void reserve(size_t n) {}
+  struct ResizeInProgress {
+    util::span<AlignedStorage<T>> from, to;
 
-  void clear() {
-    this->destroy_storage(static_data_, size_);
+    util::span<AlignedStorage<T>> uninitialized() const {
+      return to.subspan(from.size());
+    }
+    static constexpr bool to_new_allocation() { return false; }
+  };
+
+  ResizeInProgress increase_size(size_t new_size, ...) {
+    assert(new_size <= N);
+
+    ResizeInProgress out;
+    out.from = {data_ptr(), size_};
+    out.to = {data_ptr(), new_size};
+
+    size_ = new_size;
+    return out;
+  }
+
+  void destroy() {
+    for (size_t i = 0; i < size_; ++i) {
+      static_data_[i].Destroy();
+    }
+
     size_ = 0;
+  }
+
+  // Move objects from another storage, but don't destroy any objects currently
+  // stored in *this. You need to call destroy() first if necessary (e.g. in a
+  // move assignment operator).
+  void move_from(StaticVectorStorage* other) noexcept {
+    for (size_t i = 0; i < other->size_; ++i) {
+      static_data_[i].MoveFrom(&other->static_data_[i]);
+    }
+
+    size_ = other->size_;
+    other->size_ = 0;
   }
 };
 
 template <typename T, size_t N>
-struct SmallVectorStorage : public StaticVectorMixin<T> {
-  using typename StaticVectorMixin<T>::storage_type;
-
-  storage_type static_data_[N];
+struct SmallVectorStorage {
+  std::array<AlignedStorage<T>, N> static_data_;
   size_t size_ = 0;
-  storage_type* data_ = static_data_;
+  AlignedStorage<T>* data_ = static_data_.data();
   size_t dynamic_capacity_ = 0;
 
   SmallVectorStorage() noexcept = default;
 
   ~SmallVectorStorage() { destroy(); }
 
-  T* data_ptr() { return this->ptr_at(data_, 0); }
+  AlignedStorage<T>* data_ptr() { return data_; }
+  constexpr const AlignedStorage<T>* const_data_ptr() const { return data_; }
 
-  constexpr const T* const_data_ptr() const { return this->ptr_at(data_, 0); }
-
-  void bump_size(size_t addend) {
-    const size_t new_size = size_ + addend;
-    ensure_capacity(new_size);
-    size_ = new_size;
-  }
-
-  void ensure_capacity(size_t min_capacity) {
-    if (dynamic_capacity_) {
-      // Grow dynamic storage if necessary
-      if (min_capacity > dynamic_capacity_) {
-        size_t new_capacity = std::max(dynamic_capacity_ * 2, min_capacity);
-        reallocate_dynamic(new_capacity);
-      }
-    } else if (min_capacity > N) {
-      switch_to_dynamic(min_capacity);
-    }
-  }
-
-  void reduce_size(size_t reduce_by) {
-    assert(reduce_by <= size_);
-    size_ -= reduce_by;
-  }
-
-  void destroy() {
-    this->destroy_storage(data_, size_);
-    if (dynamic_capacity_) {
-      delete[] data_;
-    }
-  }
-
-  void move_from(SmallVectorStorage&& other) noexcept {
-    size_ = other.size_;
-    dynamic_capacity_ = other.dynamic_capacity_;
-    if (dynamic_capacity_) {
-      data_ = other.data_;
-      other.data_ = NULLPTR;
-      other.dynamic_capacity_ = 0;
-    } else {
-      this->move_storage(other.data_, data_, size_);
-    }
-    other.size_ = 0;
-  }
+  util::span<AlignedStorage<T>> data_span() { return {data_ptr(), size_}; }
 
   constexpr size_t capacity() const { return dynamic_capacity_ ? dynamic_capacity_ : N; }
 
   constexpr size_t max_size() const { return std::numeric_limits<size_t>::max(); }
 
-  void reserve(size_t n) {
-    if (dynamic_capacity_) {
-      if (n > dynamic_capacity_) {
-        reallocate_dynamic(n);
-      }
-    } else if (n > N) {
-      switch_to_dynamic(n);
+  void destroy() {
+    for (size_t i = 0; i < size_; ++i) {
+      data_[i].Destroy();
     }
+
+    if (dynamic_capacity_) {
+      delete[] data_;
+    }
+
+    size_ = 0;
+    dynamic_capacity_ = 0;
   }
 
-  void clear() {
-    this->destroy_storage(data_, size_);
-    size_ = 0;
+  // Move objects from another storage, but don't destroy any objects currently
+  // stored in *this. You need to call destroy() first if necessary (e.g. in a
+  // move assignment operator).
+  void move_from(SmallVectorStorage* other) noexcept {
+    if (other->dynamic_capacity_) {
+      data_ = other->data_;
+      other->data_ = NULLPTR;
+
+      dynamic_capacity_ = other->dynamic_capacity_;
+      other->dynamic_capacity_ = 0;
+    } else {
+      for (size_t i = 0; i < other->size_; ++i) {
+        data_[i].MoveFrom(&other->data_[i]);
+      }
+    }
+
+    size_ = other->size_;
+    other->size_ = 0;
+  }
+
+  struct ResizeInProgress {
+    util::span<AlignedStorage<T>> from, to;
+
+    util::span<AlignedStorage<T>> uninitialized() const {
+      return to.subspan(from.size());
+    }
+    bool to_new_allocation() const { return from.data() != to.data(); }
+
+    // ensure old data_ is deleted after the resize is complete
+    std::unique_ptr<AlignedStorage<T>[]>
+        scoped_delete;  // NOLINT modernize-avoid-c-arrays
+  };
+
+  ResizeInProgress increase_size(size_t new_size, bool move_active = true) {
+    assert(new_size > size_);
+
+    ResizeInProgress out;
+    out.from = {data_, size_};
+
+    if (new_size > N && new_size > dynamic_capacity_) {
+      // need to allocate more storage
+      if (dynamic_capacity_) {
+        out.scoped_delete.reset(data_);
+      }
+
+      dynamic_capacity_ = std::max(dynamic_capacity_ * 2, new_size);
+      data_ = new AlignedStorage<T>[dynamic_capacity_];
+
+      if (move_active) {
+        size_t i = 0;
+        for (auto& from : out.from) {
+          data_[i++].MoveFrom(&from);
+        }
+      }
+    }
+
+    size_ = new_size;
+    out.to = {data_, size_};
+    return out;
   }
 
  private:
-  void switch_to_dynamic(size_t new_capacity) {
-    dynamic_capacity_ = new_capacity;
-    data_ = new storage_type[new_capacity];
-    this->move_storage(static_data_, data_, size_);
-  }
-
-  void reallocate_dynamic(size_t new_capacity) {
+  void set_dynamic_capacity(size_t new_capacity) {
     assert(new_capacity >= size_);
-    auto new_data = new storage_type[new_capacity];
-    this->move_storage(data_, new_data, size_);
-    delete[] data_;
+
+    // NOLINTNEXTLINE modernize-avoid-c-arrays
+    std::unique_ptr<AlignedStorage<T>[]> scoped_delete;
+    if (dynamic_capacity_) {
+      // delete old data_ at the close of this scope
+      scoped_delete.reset(data_);
+    }
+
+    // NOLINTNEXTLINE modernize-avoid-c-arrays
+    auto new_data = internal::make_unique<AlignedStorage<T>[]>(new_capacity);
+    for (size_t i = 0; i < size_; ++i) {
+      new_data[i].MoveFrom(&data_[i]);
+    }
+
+    data_ = new_data.release();
     dynamic_capacity_ = new_capacity;
-    data_ = new_data;
   }
 };
 
 template <typename T, size_t N, typename Storage>
 class StaticVectorImpl {
- private:
-  Storage storage_;
-
-  T* data_ptr() { return storage_.data_ptr(); }
-
-  constexpr const T* const_data_ptr() const { return storage_.const_data_ptr(); }
-
  public:
   using size_type = size_t;
   using difference_type = ptrdiff_t;
@@ -228,72 +238,51 @@ class StaticVectorImpl {
 
   // Move and copy constructors
   StaticVectorImpl(StaticVectorImpl&& other) noexcept {
-    storage_.move_from(std::move(other.storage_));
+    storage_.move_from(&other.storage_);
   }
 
   StaticVectorImpl& operator=(StaticVectorImpl&& other) noexcept {
-    if (&other != this) {
-      storage_.destroy();
-      storage_.move_from(std::move(other.storage_));
-    }
+    storage_.destroy();
+    storage_.move_from(&other.storage_);
     return *this;
   }
 
-  StaticVectorImpl(const StaticVectorImpl& other) {
-    init_by_copying(other.storage_.size_, other.const_data_ptr());
-  }
+  StaticVectorImpl(const StaticVectorImpl& other) { assign(other.begin(), other.end()); }
 
   StaticVectorImpl& operator=(const StaticVectorImpl& other) noexcept {
     if (&other == this) {
       return *this;
     }
-    assign_by_copying(other.storage_.size_, other.data());
+    assign(other.begin(), other.end());
     return *this;
   }
 
   // Automatic conversion from std::vector<T>, for convenience
   StaticVectorImpl(const std::vector<T>& other) {  // NOLINT: explicit
-    init_by_copying(other.size(), other.data());
-  }
-
-  StaticVectorImpl(std::vector<T>&& other) noexcept {  // NOLINT: explicit
-    init_by_moving(other.size(), other.data());
+    assign(other.begin(), other.end());
   }
 
   StaticVectorImpl& operator=(const std::vector<T>& other) {
-    assign_by_copying(other.size(), other.data());
+    assign(other.begin(), other.end());
     return *this;
   }
 
+  StaticVectorImpl(std::vector<T>&& other) noexcept {  // NOLINT: explicit
+    assign(std::make_move_iterator(other.begin()), std::make_move_iterator(other.end()));
+  }
+
   StaticVectorImpl& operator=(std::vector<T>&& other) noexcept {
-    assign_by_moving(other.size(), other.data());
+    assign(std::make_move_iterator(other.begin()), std::make_move_iterator(other.end()));
     return *this;
   }
 
   // Constructing from count and optional initialization value
-  explicit StaticVectorImpl(size_t count) {
-    storage_.bump_size(count);
-    auto* p = data_ptr();
-    for (size_t i = 0; i < count; ++i) {
-      new (&p[i]) T();
-    }
-  }
+  explicit StaticVectorImpl(size_t count) { resize(count); }
 
-  StaticVectorImpl(size_t count, const T& value) {
-    storage_.bump_size(count);
-    auto* p = data_ptr();
-    for (size_t i = 0; i < count; ++i) {
-      new (&p[i]) T(value);
-    }
-  }
+  StaticVectorImpl(size_t count, const T& value) { resize(count, value); }
 
   StaticVectorImpl(std::initializer_list<T> values) {
-    storage_.bump_size(values.size());
-    auto* p = data_ptr();
-    for (auto&& v : values) {
-      // XXX cannot move initializer values?
-      new (p++) T(v);
-    }
+    assign(values.begin(), values.end());
   }
 
   constexpr bool empty() const { return storage_.size_ == 0; }
@@ -304,163 +293,132 @@ class StaticVectorImpl {
 
   constexpr size_t max_size() const { return storage_.max_size(); }
 
-  T& operator[](size_t i) { return data_ptr()[i]; }
+  T& operator[](size_t i) { return data()[i]; }
+  constexpr const T& operator[](size_t i) const { return data()[i]; }
 
-  constexpr const T& operator[](size_t i) const { return const_data_ptr()[i]; }
+  T& front() { return data()[0]; }
+  constexpr const T& front() const { return data()[0]; }
 
-  T& front() { return data_ptr()[0]; }
+  T& back() { return data()[storage_.size_ - 1]; }
+  constexpr const T& back() const { return data()[storage_.size_ - 1]; }
 
-  constexpr const T& front() const { return const_data_ptr()[0]; }
+  T* data() { return storage_.data_ptr()->get(); }
+  constexpr const T* data() const { return storage_.const_data_ptr()->get(); }
 
-  T& back() { return data_ptr()[storage_.size_ - 1]; }
+  iterator begin() { return iterator(data()); }
+  constexpr const_iterator begin() const { return data(); }
 
-  constexpr const T& back() const { return const_data_ptr()[storage_.size_ - 1]; }
+  iterator end() { return iterator(data() + storage_.size_); }
+  constexpr const_iterator end() const { return data() + storage_.size_; }
 
-  T* data() { return data_ptr(); }
-
-  constexpr const T* data() const { return const_data_ptr(); }
-
-  iterator begin() { return iterator(data_ptr()); }
-
-  constexpr const_iterator begin() const { return const_iterator(const_data_ptr()); }
-
-  iterator end() { return iterator(data_ptr() + storage_.size_); }
-
-  constexpr const_iterator end() const {
-    return const_iterator(const_data_ptr() + storage_.size_);
+  void reserve(size_t n) {
+    if (n <= capacity()) return;
+    size_t old_size = size();
+    storage_.increase_size(n);
+    storage_.size_ = old_size;
   }
 
-  void reserve(size_t n) { storage_.reserve(n); }
+  void clear() { storage_.destroy(); }
 
-  void clear() { storage_.clear(); }
+  void push_back(const T& value) { emplace_back(value); }
 
-  void push_back(const T& value) {
-    storage_.bump_size(1);
-    new (data_ptr() + storage_.size_ - 1) T(value);
-  }
-
-  void push_back(T&& value) {
-    storage_.bump_size(1);
-    new (data_ptr() + storage_.size_ - 1) T(std::move(value));
-  }
+  void push_back(T&& value) { emplace_back(std::move(value)); }
 
   template <typename... Args>
   void emplace_back(Args&&... args) {
-    storage_.bump_size(1);
-    new (data_ptr() + storage_.size_ - 1) T(std::forward<Args>(args)...);
+    auto& back = storage_.increase_size(size() + 1).uninitialized()[0];
+    back.Construct(std::forward<Args>(args)...);
   }
 
-  template <typename InputIt>
-  iterator insert(const_iterator insert_at, InputIt first, InputIt last) {
-    const size_t n = storage_.size_;
-    const size_t it_size = static_cast<size_t>(last - first);  // XXX might be O(n)?
-    const size_t pos = static_cast<size_t>(insert_at - const_data_ptr());
-    storage_.bump_size(it_size);
-    auto* p = data_ptr();
-    if (it_size == 0) {
-      return p + pos;
-    }
-    const size_t end_pos = pos + it_size;
+  template <typename ForwardIt>
+  iterator insert(const_iterator insert_at, ForwardIt first, ForwardIt last) {
+    const auto pos = insert_at - data();
+    assert(pos >= 0 && static_cast<size_t>(pos) <= size());
 
-    // Move [pos; n) to [end_pos; end_pos + n - pos)
-    size_t i = n;
-    size_t j = end_pos + n - pos;
-    while (i > pos && j > n) {
-      new (&p[--j]) T(std::move(p[--i]));
+    if (first == last) {
+      return data() + pos;
     }
-    while (i > pos) {
-      p[--j] = std::move(p[--i]);
+
+    auto num_displaced = size() - pos;
+    auto num_inserted = std::distance(first, last);
+
+    auto resized = storage_.increase_size(size() + num_inserted, /*move_active=*/false);
+
+    if (resized.to_new_allocation()) {
+      // even elements before pos must be moved
+      size_t i = 0;
+      for (auto& from : resized.from.first(pos)) {
+        resized.to[i++].MoveFrom(&from);
+      }
     }
-    assert(j == end_pos);
-    // Copy [first; last) to [pos; end_pos)
-    j = pos;
-    while (j < std::min(n, end_pos)) {
-      p[j++] = *first++;
+
+    // move displaced elements in reverse to make a gap for insertion
+    auto from_reversed = resized.from.rbegin();
+    auto to_reversed = resized.to.rbegin();
+    for (size_t i = 0; i < num_displaced; ++i) {
+      to_reversed[i].MoveFrom(&from_reversed[i]);
     }
-    while (j < end_pos) {
-      new (&p[j++]) T(*first++);
+
+    // insert into the gap from the provided iterator
+    size_t i = pos;
+    while (first != last) {
+      resized.to[i++].Construct(*first++);
     }
-    assert(first == last);
-    return p + pos;
+
+    return data() + pos;
   }
 
-  void resize(size_t n) {
-    const size_t old_size = storage_.size_;
-    if (n > storage_.size_) {
-      storage_.bump_size(n - old_size);
-      auto* p = data_ptr();
-      for (size_t i = old_size; i < n; ++i) {
-        new (&p[i]) T{};
+  template <typename ForwardIt>
+  void assign(ForwardIt begin, ForwardIt end) {
+    auto n = static_cast<size_t>(std::distance(begin, end));
+
+    if (n <= size()) {
+      decrease_size(n);
+      for (auto& slot : storage_.data_span()) {
+        *slot = *begin++;
       }
-    } else {
-      auto* p = data_ptr();
-      for (size_t i = n; i < old_size; ++i) {
-        p[i].~T();
-      }
-      storage_.reduce_size(old_size - n);
+      return;
+    }
+
+    auto resized = storage_.increase_size(n);
+
+    for (auto& slot : resized.to.first(resized.from.size())) {
+      *slot = *begin++;
+    }
+    for (auto& slot : resized.uninitialized()) {
+      slot.Construct(*begin++);
     }
   }
 
-  void resize(size_t n, const T& value) {
-    const size_t old_size = storage_.size_;
-    if (n > storage_.size_) {
-      storage_.bump_size(n - old_size);
-      auto* p = data_ptr();
-      for (size_t i = old_size; i < n; ++i) {
-        new (&p[i]) T(value);
-      }
-    } else {
-      auto* p = data_ptr();
-      for (size_t i = n; i < old_size; ++i) {
-        p[i].~T();
-      }
-      storage_.reduce_size(old_size - n);
-    }
-  }
+  void resize(size_t n) { do_resize(n); }
+
+  void resize(size_t n, const T& value) { do_resize(n, value); }
 
  private:
-  template <typename InputIt>
-  void init_by_copying(size_t n, InputIt src) {
-    storage_.bump_size(n);
-    auto* dest = data_ptr();
-    for (size_t i = 0; i < n; ++i, ++src) {
-      new (&dest[i]) T(*src);
+  template <typename... Args>
+  void do_resize(size_t n, const Args&... args) {
+    if (n <= size()) {
+      return decrease_size(n);
+    }
+
+    auto resized = storage_.increase_size(n);
+
+    for (auto& slot : resized.uninitialized()) {
+      slot.Construct(args...);
     }
   }
 
-  template <typename InputIt>
-  void init_by_moving(size_t n, InputIt src) {
-    init_by_copying(n, std::make_move_iterator(src));
-  }
+  void decrease_size(size_t n) {
+    assert(n <= size());
 
-  template <typename InputIt>
-  void assign_by_copying(size_t n, InputIt src) {
-    const size_t old_size = storage_.size_;
-    if (n > old_size) {
-      storage_.bump_size(n - old_size);
-      auto* dest = data_ptr();
-      for (size_t i = 0; i < old_size; ++i, ++src) {
-        dest[i] = *src;
-      }
-      for (size_t i = old_size; i < n; ++i, ++src) {
-        new (&dest[i]) T(*src);
-      }
-    } else {
-      auto* dest = data_ptr();
-      for (size_t i = 0; i < n; ++i, ++src) {
-        dest[i] = *src;
-      }
-      for (size_t i = n; i < old_size; ++i) {
-        dest[i].~T();
-      }
-      storage_.reduce_size(old_size - n);
+    for (auto& slot : storage_.data_span().subspan(n)) {
+      slot.Destroy();
     }
+
+    storage_.size_ = n;
   }
 
-  template <typename InputIt>
-  void assign_by_moving(size_t n, InputIt src) {
-    assign_by_copying(n, std::make_move_iterator(src));
-  }
+  Storage storage_;
 };
 
 template <typename T, size_t N>
