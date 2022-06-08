@@ -500,26 +500,18 @@ TEST_F(TestReadableFile, ThreadSafety) {
 class TestPipeIO : public ::testing::Test {
  public:
   void MakePipe() {
-    ASSERT_OK_AND_ASSIGN(auto pipe, CreatePipe());
-    r_ = pipe.rfd;
-    w_ = pipe.wfd;
-    ASSERT_GE(r_, 0);
-    ASSERT_GE(w_, 0);
+    ASSERT_OK_AND_ASSIGN(pipe_, CreatePipe());
+    ASSERT_GE(pipe_.rfd.fd(), 0);
+    ASSERT_GE(pipe_.rfd.fd(), 0);
   }
   void ClosePipe() {
-    if (r_ != -1) {
-      ASSERT_OK(FileClose(r_));
-      r_ = -1;
-    }
-    if (w_ != -1) {
-      ASSERT_OK(FileClose(w_));
-      w_ = -1;
-    }
+    ASSERT_OK(pipe_.rfd.Close());
+    ASSERT_OK(pipe_.wfd.Close());
   }
   void TearDown() { ClosePipe(); }
 
  protected:
-  int r_ = -1, w_ = -1;
+  ::arrow::internal::Pipe pipe_;
 };
 
 TEST_F(TestPipeIO, TestWrite) {
@@ -529,33 +521,32 @@ TEST_F(TestPipeIO, TestWrite) {
   int64_t bytes_read;
 
   MakePipe();
-  ASSERT_OK_AND_ASSIGN(file, FileOutputStream::Open(w_));
-  w_ = -1;  // now owned by FileOutputStream
+  ASSERT_OK_AND_ASSIGN(file, FileOutputStream::Open(pipe_.wfd.Detach()));
 
   ASSERT_OK(file->Write(data1.data(), data1.size()));
-  ASSERT_OK_AND_ASSIGN(bytes_read, FileRead(r_, buffer, 4));
+  ASSERT_OK_AND_ASSIGN(bytes_read, FileRead(pipe_.rfd.fd(), buffer, 4));
   ASSERT_EQ(bytes_read, 4);
   ASSERT_EQ(0, std::memcmp(buffer, "test", 4));
 
   ASSERT_OK(file->Write(Buffer::FromString(std::string(data2))));
-  ASSERT_OK_AND_ASSIGN(bytes_read, FileRead(r_, buffer, 4));
+  ASSERT_OK_AND_ASSIGN(bytes_read, FileRead(pipe_.rfd.fd(), buffer, 4));
   ASSERT_EQ(bytes_read, 4);
   ASSERT_EQ(0, std::memcmp(buffer, "data", 4));
 
   ASSERT_FALSE(file->closed());
   ASSERT_OK(file->Close());
   ASSERT_TRUE(file->closed());
-  ASSERT_OK_AND_ASSIGN(bytes_read, FileRead(r_, buffer, 2));
+  ASSERT_OK_AND_ASSIGN(bytes_read, FileRead(pipe_.rfd.fd(), buffer, 2));
   ASSERT_EQ(bytes_read, 1);
   ASSERT_EQ(0, std::memcmp(buffer, "!", 1));
   // EOF reached
-  ASSERT_OK_AND_ASSIGN(bytes_read, FileRead(r_, buffer, 2));
+  ASSERT_OK_AND_ASSIGN(bytes_read, FileRead(pipe_.rfd.fd(), buffer, 2));
   ASSERT_EQ(bytes_read, 0);
 }
 
 TEST_F(TestPipeIO, ReadableFileFails) {
   // ReadableFile fails on non-seekable fd
-  ASSERT_RAISES(IOError, ReadableFile::Open(r_));
+  ASSERT_RAISES(IOError, ReadableFile::Open(pipe_.rfd.fd()));
 }
 
 // ----------------------------------------------------------------------

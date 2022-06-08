@@ -95,6 +95,7 @@
 #include "arrow/util/checked_cast.h"
 #include "arrow/util/io_util.h"
 #include "arrow/util/logging.h"
+#include "arrow/util/ubsan.h"
 
 // For filename conversion
 #if defined(_WIN32)
@@ -989,8 +990,43 @@ Result<bool> FileExists(const PlatformFilename& path) {
 }
 
 //
-// Functions for creating file descriptors
+// Creating and destroying file descriptors
 //
+
+FileDescriptor::FileDescriptor(FileDescriptor&& other) : fd_(other.fd_.exchange(-1)) {}
+
+FileDescriptor& FileDescriptor::operator=(FileDescriptor&& other) {
+  int old_fd = fd_.exchange(other.fd_.exchange(-1));
+  if (old_fd != -1) {
+    CloseFromDestructor(old_fd);
+  }
+  return *this;
+}
+
+void FileDescriptor::CloseFromDestructor(int fd) {
+  auto st = FileClose(fd);
+  if (!st.ok()) {
+    st.Abort();
+    ARROW_LOG(WARNING) << "Failed to close file descriptor: " << st.ToString();
+  }
+}
+
+FileDescriptor::~FileDescriptor() {
+  int fd = fd_.load();
+  if (fd != -1) {
+    CloseFromDestructor(fd);
+  }
+}
+
+Status FileDescriptor::Close() {
+  int fd = fd_.exchange(-1);
+  if (fd != -1) {
+    return FileClose(fd);
+  }
+  return Status::OK();
+}
+
+int FileDescriptor::Detach() { return fd_.exchange(-1); }
 
 #define CHECK_LSEEK(retval) \
   if ((retval) == -1) return Status::IOError("lseek failed");
@@ -1020,6 +1056,7 @@ static inline Result<int> CheckFileOpResult(int fd_ret, int errno_actual,
   return fd_ret;
 }
 
+// TODO return FileDescriptor
 Result<int> FileOpenReadable(const PlatformFilename& file_name) {
   int fd, errno_actual;
 #if defined(_WIN32)
@@ -1146,27 +1183,191 @@ Result<int64_t> FileTell(int fd) {
 
 Result<Pipe> CreatePipe() {
   int ret;
-  int fd[2];
-#if defined(_WIN32)
-  ret = _pipe(fd, 4096, _O_BINARY);
-#else
-  ret = pipe(fd);
-#endif
+  int fds[2];
 
+#if defined(_WIN32)
+  ret = _pipe(fds, 4096, _O_BINARY);
+#else
+  ret = ::pipe(fds);
+#endif
   if (ret == -1) {
     return IOErrorFromErrno(errno, "Error creating pipe");
   }
-  return Pipe{fd[0], fd[1]};
+
+  return Pipe{FileDescriptor(fds[0]), FileDescriptor(fds[1])};
 }
 
-static Status StatusFromMmapErrno(const char* prefix) {
+Status SetPipeFileDescriptorNonBlocking(int fd) {
+#if defined(_WIN32)
+  const auto handle = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
+  DWORD mode = PIPE_NOWAIT;
+  if (!SetNamedPipeHandleState(handle, &mode, nullptr, nullptr)) {
+    return IOErrorFromWinError(GetLastError(), "Error making pipe non-blocking");
+  }
+#else
+  int flags = fcntl(fd, F_GETFL);
+  if (flags == -1 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+    return IOErrorFromErrno(errno, "Error making pipe non-blocking");
+  }
+#endif
+  return Status::OK();
+}
+
+namespace {
+
+#ifdef WIN32
+#define PIPE_WRITE _write
+#define PIPE_READ _read
+#else
+#define PIPE_WRITE write
+#define PIPE_READ read
+#endif
+
+class SelfPipeImpl : public SelfPipe {
+  using PayloadBytes = std::array<char, 8>;
+
+  static constexpr uint64_t kEofPayload = 5804561806345822987ULL;
+
+ public:
+  explicit SelfPipeImpl(bool signal_safe) : signal_safe_(signal_safe) {}
+
+  Status Init() {
+    ARROW_ASSIGN_OR_RAISE(pipe_, CreatePipe());
+    if (signal_safe_) {
+      if (!please_shutdown_.is_lock_free()) {
+        return Status::IOError("Cannot use non-lock-free atomic in a signal handler");
+      }
+      // We cannot afford blocking writes in a signal handler
+      RETURN_NOT_OK(SetPipeFileDescriptorNonBlocking(pipe_.wfd.fd()));
+    }
+    return Status::OK();
+  }
+
+  Result<uint64_t> Wait() override {
+    if (pipe_.rfd.closed()) {
+      // Already closed
+      return ClosedPipe();
+    }
+    PayloadBytes bytes;
+    char* buf = bytes.data();
+    auto buf_size = static_cast<int64_t>(bytes.size());
+    while (buf_size > 0) {
+      int64_t n_read = PIPE_READ(pipe_.rfd.fd(), buf, static_cast<uint32_t>(buf_size));
+      if (n_read < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        if (pipe_.rfd.closed()) {
+          return ClosedPipe();
+        }
+        return IOErrorFromErrno(errno, "Failed reading from self-pipe");
+      }
+      buf += n_read;
+      buf_size -= n_read;
+    }
+    const auto payload = PayloadFromBytes(bytes);
+    if (payload == kEofPayload && please_shutdown_.load()) {
+      RETURN_NOT_OK(pipe_.rfd.Close());
+      return ClosedPipe();
+    }
+    return payload;
+  }
+
+  // XXX return StatusCode from here?
+  void Send(uint64_t payload) override {
+    if (signal_safe_) {
+      int saved_errno = errno;
+      DoSend(payload);
+      errno = saved_errno;
+    } else {
+      DoSend(payload);
+    }
+  }
+
+  Status Shutdown() override {
+    please_shutdown_.store(true);
+    errno = 0;
+    if (!DoSend(kEofPayload)) {
+      if (errno) {
+        return IOErrorFromErrno(errno, "Could not shutdown self-pipe");
+      } else if (!pipe_.wfd.closed()) {
+        return Status::UnknownError("Could not shutdown self-pipe");
+      }
+    }
+    return pipe_.wfd.Close();
+  }
+
+  ~SelfPipeImpl() {
+    auto st = Shutdown();
+    if (!st.ok()) {
+      ARROW_LOG(WARNING) << "On self-pipe destruction: " << st.ToString();
+    }
+  }
+
+ protected:
+  PayloadBytes PayloadToBytes(uint64_t payload) const {
+    return arrow::util::SafeCopy<PayloadBytes>(payload);
+  }
+
+  uint64_t PayloadFromBytes(PayloadBytes bytes) const {
+    return arrow::util::SafeCopy<uint64_t>(bytes);
+  }
+
+  Status ClosedPipe() const { return Status::Invalid("Self-pipe closed"); }
+
+  bool DoSend(uint64_t payload) {
+    // This needs to be async-signal safe as it's called from Send()
+    if (pipe_.wfd.closed()) {
+      // Already closed
+      return false;
+    }
+    const auto bytes = PayloadToBytes(payload);
+    const char* buf = bytes.data();
+    auto buf_size = static_cast<int64_t>(bytes.size());
+    while (buf_size > 0) {
+      int64_t n_written =
+          PIPE_WRITE(pipe_.wfd.fd(), buf, static_cast<uint32_t>(buf_size));
+      if (n_written < 0) {
+        if (errno == EINTR) {
+          continue;
+        } else {
+          // Perhaps EAGAIN if non-blocking, or EBADF if closed in the meantime?
+          // In any case, we can't do anything more here.
+          break;
+        }
+      }
+      buf += n_written;
+      buf_size -= n_written;
+    }
+    return buf_size == 0;
+  }
+
+  const bool signal_safe_;
+  Pipe pipe_;
+  std::atomic<bool> please_shutdown_{false};
+};
+
+#undef PIPE_WRITE
+#undef PIPE_READ
+
+}  // namespace
+
+Result<std::shared_ptr<SelfPipe>> SelfPipe::Make(bool signal_safe) {
+  auto ptr = std::make_shared<SelfPipeImpl>(signal_safe);
+  RETURN_NOT_OK(ptr->Init());
+  return ptr;
+}
+
+SelfPipe::~SelfPipe() = default;
+
+namespace {
+
+Status StatusFromMmapErrno(const char* prefix) {
 #ifdef _WIN32
   errno = __map_mman_error(GetLastError(), EPERM);
 #endif
   return IOErrorFromErrno(errno, prefix);
 }
-
-namespace {
 
 int64_t GetPageSizeInternal() {
 #if defined(__APPLE__)
@@ -1408,32 +1609,44 @@ static inline int64_t pread_compat(int fd, void* buf, int64_t nbytes, int64_t po
 }
 
 Result<int64_t> FileRead(int fd, uint8_t* buffer, int64_t nbytes) {
-  int64_t bytes_read = 0;
-
-  while (bytes_read < nbytes) {
-    const int64_t chunksize =
-        std::min(static_cast<int64_t>(ARROW_MAX_IO_CHUNKSIZE), nbytes - bytes_read);
 #if defined(_WIN32)
-    int64_t ret =
-        static_cast<int64_t>(_read(fd, buffer, static_cast<uint32_t>(chunksize)));
+  HANDLE handle = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
+#endif
+  int64_t total_bytes_read = 0;
+
+  while (total_bytes_read < nbytes) {
+    const int64_t chunksize =
+        std::min(static_cast<int64_t>(ARROW_MAX_IO_CHUNKSIZE), nbytes - total_bytes_read);
+    int64_t bytes_read = 0;
+#if defined(_WIN32)
+    DWORD dwBytesRead = 0;
+    if (!ReadFile(handle, buffer, static_cast<uint32_t>(chunksize), &dwBytesRead,
+                  nullptr)) {
+      auto errnum = GetLastError();
+      // Return a normal EOF when the write end of a pipe was closed
+      if (errnum != ERROR_HANDLE_EOF && errnum != ERROR_BROKEN_PIPE) {
+        return IOErrorFromWinError(GetLastError(), "Error reading bytes from file");
+      }
+    }
+    bytes_read = dwBytesRead;
 #else
-    int64_t ret = static_cast<int64_t>(read(fd, buffer, static_cast<size_t>(chunksize)));
-    if (ret == -1 && errno == EINTR) {
-      continue;
+    bytes_read = static_cast<int64_t>(read(fd, buffer, static_cast<size_t>(chunksize)));
+    if (bytes_read == -1) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return IOErrorFromErrno(errno, "Error reading bytes from file");
     }
 #endif
 
-    if (ret == -1) {
-      return IOErrorFromErrno(errno, "Error reading bytes from file");
-    }
-    if (ret == 0) {
+    if (bytes_read == 0) {
       // EOF
       break;
     }
-    buffer += ret;
-    bytes_read += ret;
+    buffer += bytes_read;
+    total_bytes_read += bytes_read;
   }
-  return bytes_read;
+  return total_bytes_read;
 }
 
 Result<int64_t> FileReadAt(int fd, uint8_t* buffer, int64_t position, int64_t nbytes) {
