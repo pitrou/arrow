@@ -1329,7 +1329,7 @@ class TestCookieParsing : public ::testing::Test {
     if (cookie_attribute == util::nullopt) {
       EXPECT_EQ(cookie_attribute, attr);
     } else {
-      EXPECT_EQ(cookie_attribute.value(), attr.value());
+      EXPECT_EQ(*cookie_attribute, *attr);
     }
     EXPECT_EQ(start_pos_after, start_pos);
   }

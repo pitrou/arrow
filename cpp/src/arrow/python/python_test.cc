@@ -406,10 +406,10 @@ void DecimalTestFromPythonDecimalRescale(std::shared_ptr<DataType> type,
   if (expected.has_value()) {
     ASSERT_OK(
         internal::DecimalFromPythonDecimal(python_decimal.obj(), decimal_type, &value));
-    ASSERT_EQ(expected.value(), value);
+    ASSERT_EQ(*expected, value);
 
     ASSERT_OK(internal::DecimalFromPyObject(python_decimal.obj(), decimal_type, &value));
-    ASSERT_EQ(expected.value(), value);
+    ASSERT_EQ(*expected, value);
   } else {
     ASSERT_RAISES(Invalid, internal::DecimalFromPythonDecimal(python_decimal.obj(),
                                                               decimal_type, &value));

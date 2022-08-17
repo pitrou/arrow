@@ -83,8 +83,8 @@ Cookie Cookie::parse(const arrow::util::string_view& cookie_header_value) {
     cookie.has_expiry_ = true;
     cookie.expiration_time_ = std::chrono::system_clock::now();
   } else {
-    cookie.cookie_name_ = cookie_pair.value().first;
-    cookie.cookie_value_ = cookie_pair.value().second;
+    cookie.cookie_name_ = cookie_pair->first;
+    cookie.cookie_value_ = cookie_pair->second;
   }
 
   while (pos < cookie_value_str.size()) {
@@ -93,8 +93,8 @@ Cookie Cookie::parse(const arrow::util::string_view& cookie_header_value) {
       break;
     }
 
-    std::string cookie_attr_value_str = cookie_pair.value().second;
-    if (arrow::internal::AsciiEqualsCaseInsensitive(cookie_pair.value().first,
+    std::string cookie_attr_value_str = cookie_pair->second;
+    if (arrow::internal::AsciiEqualsCaseInsensitive(cookie_pair->first,
                                                     "max-age")) {
       // Note: max-age takes precedence over expires. We don't really care about other
       // attributes and will arbitrarily take the first max-age. We can stop the loop
@@ -116,7 +116,7 @@ Cookie Cookie::parse(const arrow::util::string_view& cookie_header_value) {
             std::chrono::system_clock::now() + std::chrono::seconds(max_age);
       }
       break;
-    } else if (arrow::internal::AsciiEqualsCaseInsensitive(cookie_pair.value().first,
+    } else if (arrow::internal::AsciiEqualsCaseInsensitive(cookie_pair->first,
                                                            "expires")) {
       cookie.has_expiry_ = true;
       int64_t seconds = 0;

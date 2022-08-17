@@ -1134,7 +1134,7 @@ TYPED_TEST(TestNumericIndexKernel, Random) {
           typename TypeTraits<TypeParam>::ArrayType>(chunk);
       for (auto value : *typed_chunk) {
         if (value.has_value() &&
-            value.value() == static_cast<typename TestFixture::CType>(0)) {
+            *value == static_cast<typename TestFixture::CType>(0)) {
           expected = index;
           break;
         }

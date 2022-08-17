@@ -796,7 +796,7 @@ class PushGenerator {
         return false;
       }
       if (state->consumer_fut.has_value()) {
-        auto fut = std::move(state->consumer_fut.value());
+        auto fut = *std::move(state->consumer_fut);
         state->consumer_fut.reset();
         lock.Unlock();  // unlock before potentially invoking a callback
         fut.MarkFinished(std::move(result));
@@ -827,7 +827,7 @@ class PushGenerator {
       }
       state->finished = true;
       if (state->consumer_fut.has_value()) {
-        auto fut = std::move(state->consumer_fut.value());
+        auto fut = *std::move(state->consumer_fut);
         state->consumer_fut.reset();
         lock.Unlock();  // unlock before potentially invoking a callback
         fut.MarkFinished(IterationTraits<T>::End());
@@ -1285,7 +1285,7 @@ class BackgroundGenerator {
         state->finished = true;
         state->task_finished = Future<>();
         if (waiting_future.has_value()) {
-          auto to_deliver = std::move(waiting_future.value());
+          auto to_deliver = *std::move(waiting_future);
           waiting_future.reset();
           guard.Unlock();
           to_deliver.MarkFinished(spawn_status);
@@ -1385,7 +1385,7 @@ class BackgroundGenerator {
         // At this point we are going to send an item.  Either we will add it to the
         // queue or deliver it to a waiting future.
         if (state->waiting_future.has_value()) {
-          waiting_future = std::move(state->waiting_future.value());
+          waiting_future = *std::move(state->waiting_future);
           state->waiting_future.reset();
         } else {
           state->queue.push(std::move(next));

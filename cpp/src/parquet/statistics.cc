@@ -607,8 +607,8 @@ class TypedStatisticsImpl : public TypedStatistics<DType> {
     auto maybe_min_max = CleanStatistic(min_max);
     if (!maybe_min_max) return;
 
-    auto min = maybe_min_max.value().first;
-    auto max = maybe_min_max.value().second;
+    auto min = maybe_min_max->first;
+    auto max = maybe_min_max->second;
 
     if (!has_min_max_) {
       has_min_max_ = true;

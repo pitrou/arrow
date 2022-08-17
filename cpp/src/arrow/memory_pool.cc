@@ -177,7 +177,7 @@ util::optional<MemoryPoolBackend> UserSelectedBackend() {
 MemoryPoolBackend DefaultBackend() {
   auto backend = UserSelectedBackend();
   if (backend.has_value()) {
-    return backend.value();
+    return *backend;
   }
   struct SupportedBackend default_backend = SupportedBackends().front();
   return default_backend.backend;
