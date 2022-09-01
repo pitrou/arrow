@@ -68,7 +68,7 @@ outputs:
         - {{ compiler("cuda") }}  # [cuda_compiler_version != "None"]
       host:
         # https://issues.apache.org/jira/browse/ARROW-15141
-        - aws-sdk-cpp 1.8.186
+        #- aws-sdk-cpp 1.8.186
         - boost-cpp >=1.70
         - brotli
         - bzip2
@@ -217,7 +217,7 @@ outputs:
         - pyarrow.parquet
         - pyarrow.plasma   # [unix]
         - pyarrow.fs
-        - pyarrow._s3fs
+        #- pyarrow._s3fs
         - pyarrow._hdfs
         # We can only test importing cuda package but cannot run when a
         # CUDA device is not available, for instance, when building from CI.
