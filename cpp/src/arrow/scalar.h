@@ -100,7 +100,7 @@ struct ARROW_EXPORT Scalar : public std::enable_shared_from_this<Scalar>,
   // TODO(bkietz) add compute::CastOptions
   Result<std::shared_ptr<Scalar>> CastTo(std::shared_ptr<DataType> to) const;
 
-  ARROW_EXPORT friend void PrintTo(const Scalar& scalar, std::ostream* os);
+  ARROW_FRIEND_EXPORT friend void PrintTo(const Scalar& scalar, std::ostream* os);
 
   /// \brief Apply the ScalarVisitor::Visit() method specialized to the scalar type
   Status Accept(ScalarVisitor* visitor) const;

@@ -216,7 +216,7 @@ struct ARROW_EXPORT Datum {
 
   std::string ToString() const;
 
-  ARROW_EXPORT friend void PrintTo(const Datum&, std::ostream*);
+  ARROW_FRIEND_EXPORT friend void PrintTo(const Datum&, std::ostream*);
 };
 
 ARROW_EXPORT std::string ToString(Datum::Kind kind);
