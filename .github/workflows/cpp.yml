@@ -325,6 +325,7 @@ jobs:
       ARROW_PARQUET: ON
       ARROW_S3: ON
       ARROW_USE_GLOG: OFF
+      ARROW_USE_PRECOMPILED_HEADERS: ON
       ARROW_VERBOSE_THIRDPARTY_BUILD: OFF
       ARROW_WITH_BROTLI: ON
       ARROW_WITH_BZ2: ON
@@ -342,7 +343,7 @@ jobs:
       # We can't use unity build because we don't have enough memory on
       # GitHub Actions.
       CMAKE_UNITY_BUILD: ON
-      CMAKE_UNITY_BUILD_BATCH_SIZE: 4
+      CMAKE_UNITY_BUILD_BATCH_SIZE: 2
       GTest_SOURCE: BUNDLED
     steps:
       - name: Disable Crash Dialogs
