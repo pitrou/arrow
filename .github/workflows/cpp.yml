@@ -313,7 +313,7 @@ jobs:
       ARROW_BUILD_STATIC: OFF
       ARROW_BUILD_TESTS: ON
       ARROW_BUILD_TYPE: release
-      ARROW_CXXFLAGS: "-O0"
+      ARROW_CXXFLAGS: "-O1"
       ARROW_DATASET: ON
       ARROW_FLIGHT: ON
       ARROW_FLIGHT_SQL: ON
@@ -343,7 +343,7 @@ jobs:
       # We can't use unity build because we don't have enough memory on
       # GitHub Actions.
       CMAKE_UNITY_BUILD: ON
-      CMAKE_UNITY_BUILD_BATCH_SIZE: 2
+      CMAKE_UNITY_BUILD_BATCH_SIZE: 4
       GTest_SOURCE: BUNDLED
     steps:
       - name: Disable Crash Dialogs
@@ -366,12 +366,12 @@ jobs:
       - name: Setup MSYS2
         shell: msys2 {0}
         run: ci/scripts/msys2_setup.sh cpp
-      - name: Cache ccache
-        uses: actions/cache@v3
-        with:
-          path: ccache
-          key: cpp-ccache-${{ matrix.msystem_lower}}-${{ hashFiles('cpp/**') }}
-          restore-keys: cpp-ccache-${{ matrix.msystem_lower}}-
+      #- name: Cache ccache
+        #uses: actions/cache@v3
+        #with:
+          #path: ccache
+          #key: cpp-ccache-${{ matrix.msystem_lower}}-${{ hashFiles('cpp/**') }}
+          #restore-keys: cpp-ccache-${{ matrix.msystem_lower}}-
       - name: Build
         shell: msys2 {0}
         run: |
