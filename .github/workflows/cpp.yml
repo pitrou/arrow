@@ -313,6 +313,7 @@ jobs:
       ARROW_BUILD_STATIC: OFF
       ARROW_BUILD_TESTS: ON
       ARROW_BUILD_TYPE: release
+      ARROW_CXXFLAGS: "-O1"
       ARROW_DATASET: ON
       ARROW_FLIGHT: ON
       ARROW_FLIGHT_SQL: ON
@@ -340,7 +341,7 @@ jobs:
         -DBoost_NO_BOOST_CMAKE=ON
       # We can't use unity build because we don't have enough memory on
       # GitHub Actions.
-      # CMAKE_UNITY_BUILD: ON
+      CMAKE_UNITY_BUILD: ON
       GTest_SOURCE: BUNDLED
     steps:
       - name: Disable Crash Dialogs
@@ -372,6 +373,7 @@ jobs:
       - name: Build
         shell: msys2 {0}
         run: |
+          export ARROW_CXXFLAGS=-O0
           export CMAKE_BUILD_PARALLEL_LEVEL=$NUMBER_OF_PROCESSORS
           ci/scripts/cpp_build.sh "$(pwd)" "$(pwd)/build"
       - name: Download Timezone Database
