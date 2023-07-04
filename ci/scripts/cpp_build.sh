@@ -40,6 +40,8 @@ elif [ -x "$(command -v xcrun)" ]; then
   export ARROW_GANDIVA_PC_CXX_FLAGS="-isysroot;$(xcrun --show-sdk-path)"
 fi
 
+# Reduce size of object files and libraries on CI platforms.
+# ARROW_GDB=ON can be used to override this behaviour.
 if [ "${GITHUB_ACTIONS:-false}" = "true" ]; then
   case "$(uname)" in
     Linux|Darwin|MINGW*)

@@ -866,6 +866,7 @@ services:
       ARROW_FILESYSTEM: "ON"
       ARROW_GANDIVA: "OFF"
       ARROW_GCS: "OFF"
+      ARROW_GDB: "ON"  # Override -g1 for test_gdb.py
       ARROW_HDFS: "ON"
       ARROW_JEMALLOC: "ON"
       ARROW_JSON: "ON"
