@@ -41,18 +41,18 @@ conda config --set show_channel_urls True
 conda config --set remote_connect_timeout_secs 12
 @rem Workaround for ARROW-13636
 conda config --append disallowed_packages pypy3
+@rem Use conda-forge exclusively
+conda config --add channels conda-forge
+conda config --remove channels defaults
 conda info -a
 
 @rem
 @rem Install Python to the base environment
 @rem
-conda install -q -y -c conda-forge python=%PYTHON% || exit /B
-
-@rem Can't use conda-libmamba-solver 2.0.0
-conda config --set solver classic
+conda install -q -y python=%PYTHON% || exit /B
 
 @rem Update for newer CA certificates
-conda update -q -y -c conda-forge --all || exit /B
+conda update -q -y --all || exit /B
 
 @rem
 @rem Create conda environment
@@ -66,11 +66,8 @@ if "%ARROW_BUILD_GANDIVA%" == "ON" (
 )
 @rem Install pre-built "toolchain" packages for faster builds
 set CONDA_PACKAGES=%CONDA_PACKAGES% --file=ci\conda_env_cpp.txt
-@rem Force conda to use conda-forge
-conda config --add channels conda-forge
-conda config --remove channels defaults
 @rem Arrow conda environment
-conda create -n arrow -y -c conda-forge ^
+conda create -n arrow -q -y ^
   --file=ci\conda_env_python.txt ^
   %CONDA_PACKAGES%  ^
   "ccache" ^
