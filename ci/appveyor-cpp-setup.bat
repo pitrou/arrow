@@ -74,7 +74,7 @@ conda create -n arrow -y -c conda-forge ^
   --file=ci\conda_env_python.txt ^
   %CONDA_PACKAGES%  ^
   "ccache" ^
-  "cmake" ^
+  "cmake<3.31.2" ^
   "ninja" ^
   "nomkl" ^
   "pandas" ^
