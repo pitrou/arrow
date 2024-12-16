@@ -26,6 +26,7 @@
 
 #include "arrow/array/builder_nested.h"
 #include "arrow/array/builder_primitive.h"
+#include "arrow/array/concatenate.h"
 #include "arrow/buffer_builder.h"
 #include "arrow/compute/api_aggregate.h"
 #include "arrow/compute/api_vector.h"
@@ -33,6 +34,7 @@
 #include "arrow/compute/kernels/aggregate_internal.h"
 #include "arrow/compute/kernels/aggregate_var_std_internal.h"
 #include "arrow/compute/kernels/common_internal.h"
+#include "arrow/compute/kernels/pivot_internal.h"
 #include "arrow/compute/kernels/util_internal.h"
 #include "arrow/compute/row/grouper.h"
 #include "arrow/compute/row/row_encoder_internal.h"
@@ -40,6 +42,7 @@
 #include "arrow/stl_allocator.h"
 #include "arrow/type_traits.h"
 #include "arrow/util/bit_run_reader.h"
+#include "arrow/util/bit_util.h"
 #include "arrow/util/bitmap_ops.h"
 #include "arrow/util/bitmap_writer.h"
 #include "arrow/util/checked_cast.h"
@@ -47,6 +50,7 @@
 #include "arrow/util/int128_internal.h"
 #include "arrow/util/int_util_overflow.h"
 #include "arrow/util/ree_util.h"
+#include "arrow/util/span.h"
 #include "arrow/util/task_group.h"
 #include "arrow/util/tdigest.h"
 #include "arrow/util/thread_pool.h"
@@ -56,6 +60,7 @@ namespace arrow {
 
 using internal::checked_cast;
 using internal::FirstTimeBitmapWriter;
+using util::span;
 
 namespace compute {
 namespace internal {
@@ -3319,9 +3324,270 @@ struct GroupedListFactory {
   HashAggregateKernel kernel;
   InputType argument_type;
 };
-}  // namespace
 
-namespace {
+// ----------------------------------------------------------------------
+// Pivot implementation
+
+struct GroupedPivotAccumulator {
+  Status Init(ExecContext* ctx, std::shared_ptr<DataType> value_type,
+              const PivotOptions* options) {
+    ctx_ = ctx;
+    value_type_ = std::move(value_type);
+    num_keys_ = static_cast<int>(options->key_names.size());
+    num_groups_ = 0;
+    columns_.resize(num_keys_);
+    return Status::OK();
+  }
+
+  Status Consume(span<const uint32_t> groups, span<const PivotKeyIndex> keys,
+                 const ArraySpan& values) {
+    using TakeIndexType = UInt32Type;
+    using TakeIndex = typename TypeTraits<TakeIndexType>::CType;
+
+    DCHECK_EQ(groups.size(), keys.size());
+    DCHECK_EQ(groups.size(), static_cast<size_t>(values.length));
+    // TODO allocate single buffers and slice them for individual columns
+    std::vector<std::shared_ptr<Buffer>> take_indices(num_keys_);
+    std::vector<std::shared_ptr<Buffer>> take_bitmaps(num_keys_);
+    for (int i = 0; i < num_keys_; ++i) {
+      ARROW_ASSIGN_OR_RAISE(
+          take_indices[i],
+          AllocateBuffer(num_groups_ * sizeof(TakeIndex), ctx_->memory_pool()));
+      ARROW_ASSIGN_OR_RAISE(take_bitmaps[i],
+                            AllocateEmptyBitmap(num_groups_, ctx_->memory_pool()));
+    }
+    // Populate the indices to take from for each grouped column
+    for (int64_t i = 0; i < values.length; ++i) {
+      // TODO cache the mutable_data()
+      const PivotKeyIndex key = keys[i];
+      const uint32_t group = groups[i];
+      if (key != kNullPivotKey && !values.IsNull(i)) {
+        DCHECK_LT(static_cast<int>(key), num_keys_);
+        if (bit_util::GetBit(take_bitmaps[key]->mutable_data(), group)) {
+          return DuplicateValue();
+        }
+        // For row #group in column #key, we are going to take the value at index #i
+        bit_util::SetBit(take_bitmaps[key]->mutable_data(), group);
+        take_indices[key]->mutable_data_as<TakeIndex>()[group] = i;
+      }
+    }
+    // Compute the grouped columns for this batch
+    auto values_data = values.ToArrayData();
+    ArrayVector new_columns(num_keys_);
+    for (int i = 0; i < num_keys_; ++i) {
+      auto indices_data =
+          ArrayData::Make(TypeTraits<TakeIndexType>::type_singleton(), num_groups_,
+                          {std::move(take_bitmaps[i]), std::move(take_indices[i])});
+      ARROW_ASSIGN_OR_RAISE(Datum grouped_column, Take(values_data, indices_data,
+                                                       TakeOptions::Defaults(), ctx_));
+      new_columns[i] = grouped_column.make_array();
+    }
+    return MergeColumns(std::move(new_columns));
+  }
+
+  Status Consume(span<const uint32_t> groups, const PivotKeyIndex key,
+                 const ArraySpan& values) {
+    using TakeIndexType = UInt32Type;
+    using TakeIndex = typename TypeTraits<TakeIndexType>::CType;
+
+    if (key == kNullPivotKey) {
+      // Nothing to update
+      return Status::OK();
+    }
+    DCHECK_LT(static_cast<int>(key), num_keys_);
+
+    // Only the column #key needs to be updated
+    ARROW_ASSIGN_OR_RAISE(
+        auto take_indices,
+        AllocateBuffer(num_groups_ * sizeof(TakeIndex), ctx_->memory_pool()));
+    ARROW_ASSIGN_OR_RAISE(auto take_bitmap,
+                          AllocateEmptyBitmap(num_groups_, ctx_->memory_pool()));
+
+    DCHECK_EQ(groups.size(), static_cast<size_t>(values.length));
+    for (int64_t i = 0; i < values.length; ++i) {
+      const uint32_t group = groups[i];
+      if (bit_util::GetBit(take_bitmap->mutable_data(), group)) {
+        return DuplicateValue();
+      }
+      bit_util::SetBit(take_bitmap->mutable_data(), group);
+      take_indices->mutable_data_as<TakeIndex>()[group] = i;
+    }
+    auto values_data = values.ToArrayData();
+    auto indices_data =
+        ArrayData::Make(TypeTraits<TakeIndexType>::type_singleton(), num_groups_,
+                        {std::move(take_bitmap), std::move(take_indices)});
+    ARROW_ASSIGN_OR_RAISE(Datum grouped_column,
+                          Take(values_data, indices_data, TakeOptions::Defaults(), ctx_));
+    return MergeColumn(&columns_[key], grouped_column.make_array());
+  }
+
+  Status Resize(int64_t new_num_groups) {
+    if (new_num_groups > std::numeric_limits<int32_t>::max()) {
+      return Status::NotImplemented("Pivot with more 2**31 groups");
+    }
+    return ResizeColumns(new_num_groups);
+  }
+
+  Status Merge(GroupedPivotAccumulator&& other, const ArrayData& group_id_mapping) {
+    // Scatter only accepts signed indices. We checked in Resize() above that
+    // we were inside the limites for int32.
+    auto scatter_indices = group_id_mapping.Copy();
+    scatter_indices->type = int32();
+    auto scatter_column =
+        [&](const std::shared_ptr<Array>& column) -> Result<std::shared_ptr<Array>> {
+      ScatterOptions options(/*max_index=*/num_groups_ - 1);
+      ARROW_ASSIGN_OR_RAISE(
+          auto scattered,
+          CallFunction("scatter", {column, scatter_indices}, &options, ctx_));
+      DCHECK(scattered.is_array());
+      return scattered.make_array();
+    };
+    return MergeColumns(std::move(other.columns_), std::move(scatter_column));
+  }
+
+  Result<ArrayVector> Finalize() {
+    // Ensure that columns are allocated even if num_groups_ == 0
+    RETURN_NOT_OK(ResizeColumns(num_groups_));
+    return std::move(columns_);
+  }
+
+ protected:
+  Status ResizeColumns(int64_t new_num_groups) {
+    if (new_num_groups == num_groups_ && num_groups_ != 0) {
+      return Status::OK();
+    }
+    ARROW_ASSIGN_OR_RAISE(
+        auto array_suffix,
+        MakeArrayOfNull(value_type_, new_num_groups - num_groups_, ctx_->memory_pool()));
+    for (auto& column : columns_) {
+      if (num_groups_ != 0) {
+        DCHECK_NE(column, nullptr);
+        ARROW_ASSIGN_OR_RAISE(
+            column, Concatenate({std::move(column), array_suffix}, ctx_->memory_pool()));
+      } else {
+        column = array_suffix;
+      }
+      DCHECK_EQ(column->length(), new_num_groups);
+    }
+    num_groups_ = new_num_groups;
+    return Status::OK();
+  }
+
+  using ColumnTransform =
+      std::function<Result<std::shared_ptr<Array>>(const std::shared_ptr<Array>&)>;
+
+  Status MergeColumns(ArrayVector&& other_columns,
+                      const ColumnTransform& transform = {}) {
+    DCHECK_EQ(columns_.size(), other_columns.size());
+    for (int i = 0; i < num_keys_; ++i) {
+      if (other_columns[i]) {
+        RETURN_NOT_OK(MergeColumn(&columns_[i], std::move(other_columns[i]), transform));
+      }
+    }
+    return Status::OK();
+  }
+
+  Status MergeColumn(std::shared_ptr<Array>* column, std::shared_ptr<Array> other_column,
+                     const ColumnTransform& transform = {}) {
+    if (transform) {
+      ARROW_ASSIGN_OR_RAISE(other_column, transform(other_column));
+    }
+    DCHECK_EQ(num_groups_, other_column->length());
+    if (*column) {
+      int64_t expected_non_nulls = (num_groups_ - (*column)->null_count()) +
+                                   (num_groups_ - other_column->null_count());
+      ARROW_ASSIGN_OR_RAISE(auto coalesced,
+                            CallFunction("coalesce", {*column, other_column}, ctx_));
+      if (expected_non_nulls != num_groups_ - coalesced.null_count()) {
+        return DuplicateValue();
+      }
+      *column = coalesced.make_array();
+    } else {
+      *column = other_column;
+    }
+    return Status::OK();
+  }
+
+  Status DuplicateValue() {
+    return Status::Invalid(
+        "Encountered more than one non-null value for the same grouped pivot key");
+  }
+
+  ExecContext* ctx_;
+  std::shared_ptr<DataType> value_type_;
+  int num_keys_;
+  int64_t num_groups_;
+  ArrayVector columns_;
+};
+
+struct GroupedPivotImpl : public GroupedAggregator {
+  Status Init(ExecContext* ctx, const KernelInitArgs& args) override {
+    DCHECK_EQ(args.inputs.size(), 3);
+    key_type_ = args.inputs[0].GetSharedPtr();
+    options_ = checked_cast<const PivotOptions*>(args.options);
+    DCHECK_NE(options_, nullptr);
+    auto value_type = args.inputs[1].GetSharedPtr();
+    FieldVector fields;
+    fields.reserve(options_->key_names.size());
+    for (const auto& key_name : options_->key_names) {
+      fields.push_back(field(key_name, value_type));
+    }
+    out_type_ = struct_(std::move(fields));
+    out_struct_type_ = checked_cast<const StructType*>(out_type_.get());
+    ARROW_ASSIGN_OR_RAISE(key_mapper_, PivotKeyMapper::Make(*key_type_, options_));
+    RETURN_NOT_OK(accumulator_.Init(ctx, value_type, options_));
+    return Status::OK();
+  }
+
+  Status Resize(int64_t new_num_groups) override {
+    num_groups_ = new_num_groups;
+    return accumulator_.Resize(new_num_groups);
+  }
+
+  Status Merge(GroupedAggregator&& raw_other,
+               const ArrayData& group_id_mapping) override {
+    auto other = checked_cast<GroupedPivotImpl*>(&raw_other);
+    return accumulator_.Merge(std::move(other->accumulator_), group_id_mapping);
+  }
+
+  Status Consume(const ExecSpan& batch) override {
+    DCHECK_EQ(batch.values.size(), 3);
+    auto groups = batch[2].array.GetSpan<const uint32_t>(1, batch.length);
+    if (!batch[1].is_array()) {
+      return Status::NotImplemented("Consuming scalar pivot value");
+    }
+    if (batch[0].is_array()) {
+      ARROW_ASSIGN_OR_RAISE(span<const PivotKeyIndex> keys,
+                            key_mapper_->MapKeys(batch[0].array));
+      return accumulator_.Consume(groups, keys, batch[1].array);
+    } else {
+      ARROW_ASSIGN_OR_RAISE(PivotKeyIndex key, key_mapper_->MapKey(*batch[0].scalar));
+      return accumulator_.Consume(groups, key, batch[1].array);
+    }
+  }
+
+  Result<Datum> Finalize() override {
+    ARROW_ASSIGN_OR_RAISE(auto columns, accumulator_.Finalize());
+    DCHECK_EQ(columns.size(), static_cast<size_t>(out_struct_type_->num_fields()));
+    return std::make_shared<StructArray>(out_type_, num_groups_, std::move(columns),
+                                         /*null_bitmap=*/nullptr,
+                                         /*null_count=*/0);
+  }
+
+  std::shared_ptr<DataType> out_type() const override { return out_type_; }
+
+  std::shared_ptr<DataType> key_type_;
+  std::shared_ptr<DataType> out_type_;
+  const StructType* out_struct_type_;
+  const PivotOptions* options_;
+  std::unique_ptr<PivotKeyMapper> key_mapper_;
+  GroupedPivotAccumulator accumulator_;
+  int64_t num_groups_ = 0;
+};
+
+// ----------------------------------------------------------------------
+// Docstrings
+
 const FunctionDoc hash_count_doc{
     "Count the number of null / non-null values in each group",
     ("By default, only non-null values are counted.\n"
@@ -3456,6 +3722,18 @@ const FunctionDoc hash_one_doc{"Get one value from each group",
 const FunctionDoc hash_list_doc{"List all values in each group",
                                 ("Null values are also returned."),
                                 {"array", "group_id_array"}};
+
+const FunctionDoc hash_pivot_doc{
+    "Pivot values according to a pivot key column",
+    ("Output is a struct array with as many fields as `PivotOptions.key_names`.\n"
+     "All output struct fields have the same type as `pivot_values`.\n"
+     "Each pivot key decides in which output field the corresponding pivot value\n"
+     "is emitted. If a pivot key doesn't appear in a given group, null is emitted.\n"
+     "If a pivot key appears twice in a given group, KeyError is raised.\n"
+     "Behavior of unexpected pivot keys is controlled by PivotOptions."),
+    {"pivot_keys", "pivot_values", "group_id_array"},
+    "PivotOptions"};
+
 }  // namespace
 
 void RegisterHashAggregateBasic(FunctionRegistry* registry) {
@@ -3703,6 +3981,20 @@ void RegisterHashAggregateBasic(FunctionRegistry* registry) {
     DCHECK_OK(AddHashAggKernels({null(), boolean(), decimal128(1, 1), decimal256(1, 1),
                                  month_interval(), fixed_size_binary(1)},
                                 GroupedListFactory::Make, func.get()));
+    DCHECK_OK(registry->AddFunction(std::move(func)));
+  }
+
+  {
+    auto func = std::make_shared<HashAggregateFunction>("hash_pivot", Arity::Ternary(),
+                                                        hash_pivot_doc);
+    for (auto key_type : BaseBinaryTypes()) {
+      // Anything that scatter() (i.e. take()) accepts can be passed as values
+      auto sig = KernelSignature::Make(
+          {key_type->id(), InputType::Any(), InputType(Type::UINT32)},
+          OutputType(ResolveGroupOutputType));
+      DCHECK_OK(func->AddKernel(
+          MakeKernel(std::move(sig), HashAggregateInit<GroupedPivotImpl>)));
+    }
     DCHECK_OK(registry->AddFunction(std::move(func)));
   }
 }

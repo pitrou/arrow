@@ -96,9 +96,13 @@ Result<AggregateNodeArgs<HashAggregateKernel>> GroupByNode::MakeAggregateNodeArg
 
   // Find input field indices for aggregates
   std::vector<std::vector<int>> agg_src_fieldsets(aggs.size());
+  //   ARROW_LOG(INFO) << "input schema: " << input_schema->ToString();
   for (size_t i = 0; i < aggs.size(); ++i) {
     const auto& target_fieldset = aggs[i].target;
+    //     ARROW_LOG(INFO) << "target #" << i << " has " << target_fieldset.size() << "
+    //     targets";
     for (const auto& target : target_fieldset) {
+      //       ARROW_LOG(INFO) << "  ... " << target.ToString();
       ARROW_ASSIGN_OR_RAISE(auto match, target.FindOne(*input_schema));
       agg_src_fieldsets[i].push_back(match[0]);
     }
@@ -108,6 +112,8 @@ Result<AggregateNodeArgs<HashAggregateKernel>> GroupByNode::MakeAggregateNodeArg
   std::vector<std::vector<TypeHolder>> agg_src_types(aggs.size());
   for (size_t i = 0; i < aggs.size(); ++i) {
     for (const auto& agg_src_field_id : agg_src_fieldsets[i]) {
+      //       ARROW_LOG(INFO) << "target #" << i << " field = " <<
+      //       input_schema->field(agg_src_field_id)->ToString();
       agg_src_types[i].push_back(input_schema->field(agg_src_field_id)->type().get());
     }
   }
@@ -282,6 +288,11 @@ Status GroupByNode::Merge() {
       DCHECK(state0->agg_states[span_i]);
       batch_ctx.SetState(state0->agg_states[span_i].get());
 
+      // XXX this resizes each KernelState (state0->agg_states[span_i]) multiple times.
+      // An alternative would be a two-pass algorithm:
+      // 1. Compute all transpositions (one per local state) and the final number of
+      // groups.
+      // 2. Process all agg kernels, resizing each KernelState only once.
       RETURN_NOT_OK(
           agg_kernels_[span_i]->resize(&batch_ctx, state0->grouper->num_groups()));
       RETURN_NOT_OK(agg_kernels_[span_i]->merge(

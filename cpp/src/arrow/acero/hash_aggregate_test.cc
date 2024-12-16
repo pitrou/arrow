@@ -33,13 +33,9 @@
 #include "arrow/array/concatenate.h"
 #include "arrow/chunked_array.h"
 #include "arrow/compute/api_aggregate.h"
-#include "arrow/compute/api_scalar.h"
-#include "arrow/compute/api_vector.h"
 #include "arrow/compute/cast.h"
 #include "arrow/compute/exec.h"
 #include "arrow/compute/exec_internal.h"
-#include "arrow/compute/kernels/aggregate_internal.h"
-#include "arrow/compute/kernels/codegen_internal.h"
 #include "arrow/compute/registry.h"
 #include "arrow/compute/row/grouper.h"
 #include "arrow/compute/row/grouper_internal.h"
@@ -51,9 +47,7 @@
 #include "arrow/type.h"
 #include "arrow/type_traits.h"
 #include "arrow/util/async_generator.h"
-#include "arrow/util/bitmap_reader.h"
 #include "arrow/util/checked_cast.h"
-#include "arrow/util/int_util_overflow.h"
 #include "arrow/util/key_value_metadata.h"
 #include "arrow/util/logging.h"
 #include "arrow/util/string.h"
@@ -65,7 +59,6 @@ using testing::HasSubstr;
 
 namespace arrow {
 
-using internal::BitmapReader;
 using internal::checked_cast;
 using internal::checked_pointer_cast;
 using internal::ToChars;
@@ -76,6 +69,7 @@ using compute::default_exec_context;
 using compute::ExecSpan;
 using compute::FunctionOptions;
 using compute::Grouper;
+using compute::PivotOptions;
 using compute::RowSegmenter;
 using compute::ScalarAggregateOptions;
 using compute::Segment;
@@ -1489,6 +1483,7 @@ class GroupBy : public ::testing::TestWithParam<GroupByFunction> {
     return acero::GroupByTest(GetParam(), arguments, keys, aggregates, use_threads);
   }
 
+  // TODO why not rename this to GroupByTest?
   Result<Datum> AltGroupBy(const std::vector<Datum>& arguments,
                            const std::vector<Datum>& keys,
                            const std::vector<Datum>& segment_keys,
@@ -5266,6 +5261,60 @@ TEST_P(GroupBy, OnlyKeys) {
   ])"),
                       aggregated_and_grouped,
                       /*verbose=*/true);
+  }
+}
+
+// TODO unused key_names
+// TODO unexpected key_names
+// TODO duplicate values
+// TODO duplicate keys
+// TODO nulls in keys
+// TODO nulls in values
+TEST_P(GroupBy, PivotFloatValues) {
+  auto value_type = float32();
+  for (bool use_threads : {false, true}) {
+    for (const auto& key_type : BaseBinaryTypes()) {
+      ARROW_SCOPED_TRACE("key_type = ", *key_type);
+      ARROW_SCOPED_TRACE(use_threads ? "parallel/merged" : "serial");
+
+      auto table =
+          TableFromJSON(schema({field("group_key", int64()), field("key", utf8()),
+                                field("value", value_type)}),
+                        {R"([
+          [1, "width", 10.5],
+          [2, "width", 11.5]
+          ])",
+                         R"([
+          [2, "height", 12.5],
+          [3, "width",  13.5],
+          [1, "height", 14.5]
+          ])"});
+
+      auto options =
+          std::make_shared<PivotOptions>(PivotOptions(/*key_names=*/{"height", "width"}));
+      Aggregate agg{"hash_pivot", options,
+                    /*target=*/std::vector<FieldRef>{"agg_0", "agg_1"}, /*name=*/"out"};
+      ASSERT_OK_AND_ASSIGN(
+          Datum aggregated_and_grouped,
+          AltGroupBy({table->GetColumnByName("key"), table->GetColumnByName("value")},
+                     {table->GetColumnByName("group_key")},
+                     /*segment_keys=*/{}, {agg}, use_threads));
+      ValidateOutput(aggregated_and_grouped);
+
+      AssertDatumsEqual(
+          ArrayFromJSON(struct_({
+                            field("key_0", int64()),
+                            field("out", struct_({field("height", value_type),
+                                                  field("width", value_type)})),
+                        }),
+                        R"([
+          [1,    {"height": 14.5, "width": 10.5} ],
+          [2,    {"height": 12.5, "width": 11.5} ],
+          [3,    {"height": null, "width": 13.5} ]
+          ])"),
+          aggregated_and_grouped,
+          /*verbose=*/true);
+    }
   }
 }
 
