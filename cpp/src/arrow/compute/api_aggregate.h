@@ -175,6 +175,88 @@ class ARROW_EXPORT TDigestOptions : public FunctionOptions {
   uint32_t min_count;
 };
 
+/// \brief Control Pivot kernel behavior
+///
+/// These options apply to the "pivot" and "hash_pivot" functions.
+///
+/// Constraints:
+/// - The corresponding `Aggregate::target` must have two FieldRef elements;
+///   the first one points to the pivot key column, the second points to the
+///   pivoted data column.
+/// - The pivot key column must be string-like; its values will be matched
+///   against `key_names` in order to dispatch the pivoted data into the
+///   output.
+///
+/// "pivot" example
+/// --------------------
+///
+/// Assuming the following two input columns with types utf8 and int16 (respectively):
+/// ```
+/// width   |  11
+/// height  |  13
+/// ```
+/// and the options `PivotOptions(.key_names = {"height", "width"})`
+///
+/// then the output will be a scalar with the type
+/// `struct{"height": int16, "width": int16}`
+/// and the value `{"height": 13, "width": 11}`.
+///
+/// "hash_pivot" example
+/// --------------------
+///
+/// Assuming the following input with schema
+/// `{"group": int32, "key": utf8, "value": int16}`:
+/// ```
+///  group |  key     |  value
+/// -----------------------------
+///   1    |  height  |    11
+///   1    |  width   |    12
+///   2    |  width   |    13
+///   3    |  height  |    14
+///   3    |  depth   |    15
+/// ```
+/// and the following settings:
+/// - a hash grouping key "group"
+/// - Aggregate(
+///     .function = "hash_pivot",
+///     .options = PivotOptions(.key_names = {"height", "width"}),
+///     .target = {"key", "value"},
+///     .name = {"properties"})
+///
+/// then the output will have the schema
+/// `{"group": int32, "properties": struct{"height": int16, "width": int16}}`
+/// and the following value:
+/// ```
+///  group |     properties
+///        |  height  |   width
+/// -----------------------------
+///   1    |   11     |    12
+///   2    |   null   |    13
+///   3    |   14     |    null
+/// ```
+class ARROW_EXPORT PivotOptions : public FunctionOptions {
+ public:
+  // Configure the behavior of pivot keys not in `key_names`
+  enum UnexpectedKeyBehavior {
+    // Unexpected pivot keys are ignored silently
+    kIgnore,
+    // Unexpected pivot keys return a KeyError
+    kRaise
+  };
+
+  explicit PivotOptions(std::vector<std::string> key_names,
+                        UnexpectedKeyBehavior unexpected_key_behavior = kIgnore);
+  // Default constructor for serialization
+  PivotOptions();
+  static constexpr char const kTypeName[] = "PivotOptions";
+  static PivotOptions Defaults() { return PivotOptions{}; }
+
+  // The values expected in the pivot key column
+  std::vector<std::string> key_names;
+  // The behavior when pivot keys not in `key_names` are encountered
+  UnexpectedKeyBehavior unexpected_key_behavior = kIgnore;
+};
+
 /// \brief Control Index kernel behavior
 class ARROW_EXPORT IndexOptions : public FunctionOptions {
  public:
