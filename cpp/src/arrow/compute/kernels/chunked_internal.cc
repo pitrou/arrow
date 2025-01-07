@@ -112,8 +112,9 @@ Status ChunkedIndexMapper::PhysicalToLogical() {
     DCHECK_LT(loc.chunk_index(), chunk_offsets.size());
     DCHECK_LT(loc.index_in_chunk(),
               static_cast<uint64_t>(chunk_lengths_[loc.chunk_index()]));
-    indices_begin_[i] =
-        chunk_offsets[loc.chunk_index()] + static_cast<int64_t>(loc.index_in_chunk());
+    const uint64_t logical_index =
+        static_cast<uint64_t>(chunk_offsets[loc.chunk_index()]) + loc.index_in_chunk();
+    indices_begin_[i] = logical_index | loc.logical_duplicate_mask();
   }
 
   return Status::OK();

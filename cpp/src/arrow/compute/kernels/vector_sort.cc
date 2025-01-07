@@ -44,13 +44,15 @@ class ChunkedArraySorter : public TypeVisitor {
  public:
   ChunkedArraySorter(ExecContext* ctx, uint64_t* indices_begin, uint64_t* indices_end,
                      const std::shared_ptr<DataType>& physical_type,
-                     const ArrayVector& physical_chunks, const SortOrder order,
-                     const NullPlacement null_placement, NullPartitionResult* output)
+                     const ArrayVector& physical_chunks, bool mark_duplicates,
+                     const SortOrder order, const NullPlacement null_placement,
+                     NullPartitionResult* output)
       : TypeVisitor(),
         indices_begin_(indices_begin),
         indices_end_(indices_end),
         physical_type_(physical_type),
         physical_chunks_(physical_chunks),
+        mark_duplicates_(mark_duplicates),
         order_(order),
         null_placement_(null_placement),
         ctx_(ctx),
@@ -70,6 +72,15 @@ class ChunkedArraySorter : public TypeVisitor {
 
   Status Visit(const NullType&) override {
     std::iota(indices_begin_, indices_end_, 0);
+    auto p =
+        NullPartitionResult::NullsOnly(indices_begin_, indices_end_, null_placement_);
+    if (mark_duplicates_ && indices_begin_ != indices_end_) {
+      auto it = indices_begin_;
+      while (++it < indices_end_) {
+        *it |= kDuplicateMask;
+      }
+    }
+    *output_ = p;
     return Status::OK();
   }
 
@@ -90,6 +101,16 @@ class ChunkedArraySorter : public TypeVisitor {
     // This is a serial implementation.
     std::vector<NullPartitionResult> sorted(num_chunks);
 
+    // If we have only chunk, we can pass mark_duplicates_ directly to the
+    // array sorter and avoid the logical-to-physical conversion below.
+    if (num_chunks == 1) {
+      ARROW_ASSIGN_OR_RAISE(
+          sorted[0], array_sorter_(indices_begin_, indices_end_, *arrays[0], /*offset=*/0,
+                                   mark_duplicates_, options, ctx_));
+      *output_ = sorted[0];
+      return Status::OK();
+    }
+
     // First sort all individual chunks
     int64_t begin_offset = 0;
     int64_t end_offset = 0;
@@ -98,69 +119,71 @@ class ChunkedArraySorter : public TypeVisitor {
       const auto array = checked_cast<const ArrayType*>(arrays[i]);
       end_offset += array->length();
       null_count += array->null_count();
-      ARROW_ASSIGN_OR_RAISE(sorted[i], array_sorter_(indices_begin_ + begin_offset,
-                                                     indices_begin_ + end_offset, *array,
-                                                     begin_offset, options, ctx_));
+      ARROW_ASSIGN_OR_RAISE(
+          sorted[i], array_sorter_(indices_begin_ + begin_offset,
+                                   indices_begin_ + end_offset, *array, begin_offset,
+                                   /*mark_duplicates=*/false, options, ctx_));
       begin_offset = end_offset;
     }
     DCHECK_EQ(end_offset, num_indices);
 
     // Then merge them by pairs, recursively
-    if (sorted.size() > 1) {
-      ChunkedIndexMapper chunked_mapper(arrays, indices_begin_, indices_end_);
-      ARROW_ASSIGN_OR_RAISE(auto chunked_indices_pair,
-                            chunked_mapper.LogicalToPhysical());
-      auto [chunked_indices_begin, chunked_indices_end] = chunked_indices_pair;
+    ChunkedIndexMapper chunked_mapper(arrays, indices_begin_, indices_end_);
+    ARROW_ASSIGN_OR_RAISE(auto chunked_indices_pair, chunked_mapper.LogicalToPhysical());
+    auto [chunked_indices_begin, chunked_indices_end] = chunked_indices_pair;
 
-      std::vector<ChunkedNullPartitionResult> chunk_sorted(num_chunks);
-      for (int i = 0; i < num_chunks; ++i) {
-        chunk_sorted[i] = sorted[i].TranslateTo(indices_begin_, chunked_indices_begin);
-      }
-
-      auto merge_nulls = [&](CompressedChunkLocation* nulls_begin,
-                             CompressedChunkLocation* nulls_middle,
-                             CompressedChunkLocation* nulls_end,
-                             CompressedChunkLocation* temp_indices, int64_t null_count) {
-        if (has_null_like_values<typename ArrayType::TypeClass>()) {
-          PartitionNullsOnly<StablePartitioner>(nulls_begin, nulls_end, arrays,
-                                                null_count, null_placement_);
-        }
-      };
-      auto merge_non_nulls =
-          [&](CompressedChunkLocation* range_begin, CompressedChunkLocation* range_middle,
-              CompressedChunkLocation* range_end, CompressedChunkLocation* temp_indices) {
-            MergeNonNulls<ArrayType>(range_begin, range_middle, range_end, arrays,
-                                     temp_indices);
-          };
-
-      ChunkedMergeImpl merge_impl{null_placement_, std::move(merge_nulls),
-                                  std::move(merge_non_nulls)};
-      // std::merge is only called on non-null values, so size temp indices accordingly
-      RETURN_NOT_OK(merge_impl.Init(ctx_, num_indices - null_count));
-
-      while (chunk_sorted.size() > 1) {
-        // Merge all pairs of chunks
-        auto out_it = chunk_sorted.begin();
-        auto it = chunk_sorted.begin();
-        while (it < chunk_sorted.end() - 1) {
-          const auto& left = *it++;
-          const auto& right = *it++;
-          DCHECK_EQ(left.overall_end(), right.overall_begin());
-          const auto merged = merge_impl.Merge(left, right, null_count);
-          *out_it++ = merged;
-        }
-        if (it < chunk_sorted.end()) {
-          *out_it++ = *it++;
-        }
-        chunk_sorted.erase(out_it, chunk_sorted.end());
-      }
-
-      // Reverse everything
-      sorted.resize(1);
-      sorted[0] = chunk_sorted[0].TranslateTo(chunked_indices_begin, indices_begin_);
-
-      RETURN_NOT_OK(chunked_mapper.PhysicalToLogical());
+    std::vector<ChunkedNullPartitionResult> chunk_sorted(num_chunks);
+    for (int i = 0; i < num_chunks; ++i) {
+      chunk_sorted[i] = sorted[i].TranslateTo(indices_begin_, chunked_indices_begin);
     }
+
+    auto merge_nulls = [&](CompressedChunkLocation* nulls_begin,
+                           CompressedChunkLocation* nulls_middle,
+                           CompressedChunkLocation* nulls_end,
+                           CompressedChunkLocation* temp_indices, int64_t null_count) {
+      if (has_null_like_values<typename ArrayType::TypeClass>()) {
+        PartitionNullsOnly<StablePartitioner>(nulls_begin, nulls_end, arrays, null_count,
+                                              null_placement_);
+      }
+    };
+    auto merge_non_nulls =
+        [&](CompressedChunkLocation* range_begin, CompressedChunkLocation* range_middle,
+            CompressedChunkLocation* range_end, CompressedChunkLocation* temp_indices) {
+          MergeNonNulls<ArrayType>(range_begin, range_middle, range_end, arrays,
+                                   temp_indices);
+        };
+
+    ChunkedMergeImpl merge_impl{null_placement_, std::move(merge_nulls),
+                                std::move(merge_non_nulls)};
+    // std::merge is only called on non-null values, so size temp indices accordingly
+    RETURN_NOT_OK(merge_impl.Init(ctx_, num_indices - null_count));
+
+    while (chunk_sorted.size() > 1) {
+      // Merge all pairs of chunks
+      auto out_it = chunk_sorted.begin();
+      auto it = chunk_sorted.begin();
+      while (it < chunk_sorted.end() - 1) {
+        const auto& left = *it++;
+        const auto& right = *it++;
+        DCHECK_EQ(left.overall_end(), right.overall_begin());
+        const auto merged = merge_impl.Merge(left, right, null_count);
+        *out_it++ = merged;
+      }
+      if (it < chunk_sorted.end()) {
+        *out_it++ = *it++;
+      }
+      chunk_sorted.erase(out_it, chunk_sorted.end());
+    }
+
+    if (mark_duplicates_) {
+      MarkDuplicates<ArrayType>(chunk_sorted[0], arrays);
+    }
+
+    // Reverse everything
+    sorted.resize(1);
+    sorted[0] = chunk_sorted[0].TranslateTo(chunked_indices_begin, indices_begin_);
+
+    RETURN_NOT_OK(chunked_mapper.PhysicalToLogical());
 
     DCHECK_EQ(sorted.size(), 1);
     DCHECK_EQ(sorted[0].overall_begin(), indices_begin_);
@@ -199,6 +222,31 @@ class ChunkedArraySorter : public TypeVisitor {
     std::copy(temp_indices, temp_indices + (range_end - range_begin), range_begin);
   }
 
+  template <typename ArrayType>
+  void MarkDuplicates(ChunkedNullPartitionResult p, span<const Array* const> arrays) {
+    // TODO GH-45193: what about NaNs vs. actual nulls?
+    using ArrowType = typename ArrayType::TypeClass;
+    using ValueType = decltype(ChunkValue<ArrowType>(arrays, p.non_nulls_begin[0]));
+
+    if (p.non_nulls_end != p.non_nulls_begin) {
+      auto it = p.non_nulls_begin;
+      ValueType prev_value = ChunkValue<ArrowType>(arrays, *it);
+      while (++it < p.non_nulls_end) {
+        ValueType curr_value = ChunkValue<ArrowType>(arrays, *it);
+        if (curr_value == prev_value) {
+          it->MarkDuplicate();
+        }
+        prev_value = curr_value;
+      }
+    }
+    if (p.nulls_end != p.nulls_begin) {
+      auto it = p.nulls_begin;
+      while (++it < p.nulls_end) {
+        it->MarkDuplicate();
+      }
+    }
+  }
+
   template <typename ArrowType>
   auto ChunkValue(span<const Array* const> arrays, CompressedChunkLocation loc) const {
     return ResolvedChunk(arrays[loc.chunk_index()],
@@ -210,6 +258,7 @@ class ChunkedArraySorter : public TypeVisitor {
   uint64_t* indices_end_;
   const std::shared_ptr<DataType>& physical_type_;
   const ArrayVector& physical_chunks_;
+  const bool mark_duplicates_;
   const SortOrder order_;
   const NullPlacement null_placement_;
   ArraySortFunc array_sorter_;
@@ -994,7 +1043,8 @@ class SortIndicesMetaFunction : public MetaFunction {
     auto out_end = out_begin + length;
     std::iota(out_begin, out_end, 0);
 
-    RETURN_NOT_OK(SortChunkedArray(ctx, out_begin, out_end, chunked_array, order,
+    RETURN_NOT_OK(SortChunkedArray(ctx, out_begin, out_end, chunked_array,
+                                   /*mark_duplicates=*/false, order,
                                    options.null_placement));
     return Datum(out);
   }
@@ -1138,21 +1188,22 @@ Result<std::vector<SortField>> FindSortKeys(const Schema& schema,
 Result<NullPartitionResult> SortChunkedArray(ExecContext* ctx, uint64_t* indices_begin,
                                              uint64_t* indices_end,
                                              const ChunkedArray& chunked_array,
-                                             SortOrder sort_order,
+                                             bool mark_duplicates, SortOrder sort_order,
                                              NullPlacement null_placement) {
   auto physical_type = GetPhysicalType(chunked_array.type());
   auto physical_chunks = GetPhysicalChunks(chunked_array, physical_type);
   return SortChunkedArray(ctx, indices_begin, indices_end, physical_type, physical_chunks,
-                          sort_order, null_placement);
+                          mark_duplicates, sort_order, null_placement);
 }
 
 Result<NullPartitionResult> SortChunkedArray(
     ExecContext* ctx, uint64_t* indices_begin, uint64_t* indices_end,
     const std::shared_ptr<DataType>& physical_type, const ArrayVector& physical_chunks,
-    SortOrder sort_order, NullPlacement null_placement) {
+    bool mark_duplicates, SortOrder sort_order, NullPlacement null_placement) {
   NullPartitionResult output;
   ChunkedArraySorter sorter(ctx, indices_begin, indices_end, physical_type,
-                            physical_chunks, sort_order, null_placement, &output);
+                            physical_chunks, mark_duplicates, sort_order, null_placement,
+                            &output);
   RETURN_NOT_OK(sorter.Sort());
   return output;
 }

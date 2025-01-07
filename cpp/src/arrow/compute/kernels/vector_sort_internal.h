@@ -456,25 +456,33 @@ using MergeImpl = GenericMergeImpl<uint64_t, NullPartitionResult>;
 using ChunkedMergeImpl =
     GenericMergeImpl<CompressedChunkLocation, ChunkedNullPartitionResult>;
 
+// ----------------------------------------------------------------------
+// High-level sorting functions
+
+constexpr uint64_t kDuplicateMask = 1ULL << 63;
+
 // TODO make this usable if indices are non trivial on input
 // (see ConcreteRecordBatchColumnSorter)
-// `offset` is used when this is called on a chunk of a chunked array
+
+// `offset` is used when this is called on a chunk of a chunked array.
+// If `mark_duplicates` is true, then if an index points to the same value
+// as the previous index, it is OR'ed with `kDuplicateMask`.
 using ArraySortFunc = std::function<Result<NullPartitionResult>(
     uint64_t* indices_begin, uint64_t* indices_end, const Array& values, int64_t offset,
-    const ArraySortOptions& options, ExecContext* ctx)>;
+    bool mark_duplicates, const ArraySortOptions& options, ExecContext* ctx)>;
 
 Result<ArraySortFunc> GetArraySorter(const DataType& type);
 
 Result<NullPartitionResult> SortChunkedArray(ExecContext* ctx, uint64_t* indices_begin,
                                              uint64_t* indices_end,
                                              const ChunkedArray& chunked_array,
-                                             SortOrder sort_order,
+                                             bool mark_duplicates, SortOrder sort_order,
                                              NullPlacement null_placement);
 
 Result<NullPartitionResult> SortChunkedArray(
     ExecContext* ctx, uint64_t* indices_begin, uint64_t* indices_end,
     const std::shared_ptr<DataType>& physical_type, const ArrayVector& physical_chunks,
-    SortOrder sort_order, NullPlacement null_placement);
+    bool mark_duplicates, SortOrder sort_order, NullPlacement null_placement);
 
 Result<NullPartitionResult> SortStructArray(ExecContext* ctx, uint64_t* indices_begin,
                                             uint64_t* indices_end,

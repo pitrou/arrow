@@ -138,13 +138,45 @@ inline void VisitRawValuesInline(const ArraySpan& values,
 }
 
 template <typename ArrowType>
-class ArrayCompareSorter {
+class ArraySorterMixin {
+ protected:
   using ArrayType = typename TypeTraits<ArrowType>::ArrayType;
   using GetView = GetViewType<ArrowType>;
+  using ValueType =
+      decltype(GetView::LogicalValue(std::declval<ArrayType>().GetView(uint64_t(0))));
+
+  void MarkDuplicates(NullPartitionResult p, const ArrayType& values,
+                      int64_t offset) const {
+    // TODO GH-45193: what about NaNs vs. actual nulls?
+    if (p.non_nulls_end != p.non_nulls_begin) {
+      auto it = p.non_nulls_begin;
+      ValueType prev_value = GetView::LogicalValue(values.GetView(*it - offset));
+      while (++it < p.non_nulls_end) {
+        ValueType curr_value = GetView::LogicalValue(values.GetView(*it - offset));
+        if (curr_value == prev_value) {
+          *it |= kDuplicateMask;
+        }
+        prev_value = curr_value;
+      }
+    }
+    if (p.nulls_end != p.nulls_begin) {
+      auto it = p.nulls_begin;
+      while (++it < p.nulls_end) {
+        *it |= kDuplicateMask;
+      }
+    }
+  }
+};
+
+template <typename ArrowType, typename Base = ArraySorterMixin<ArrowType>>
+class ArrayCompareSorter : Base {
+  using ArrayType = typename Base::ArrayType;
+  using GetView = typename Base::GetView;
 
  public:
   Result<NullPartitionResult> operator()(uint64_t* indices_begin, uint64_t* indices_end,
                                          const Array& array, int64_t offset,
+                                         bool mark_duplicates,
                                          const ArraySortOptions& options, ExecContext*) {
     const auto& values = checked_cast<const ArrayType&>(array);
 
@@ -169,6 +201,9 @@ class ArrayCompareSorter {
             return rhs < lhs;
           });
     }
+    if (mark_duplicates) {
+      Base::MarkDuplicates(p, values, offset);
+    }
     return p;
   }
 };
@@ -178,6 +213,7 @@ class ArrayCompareSorter<DictionaryType> {
  public:
   Result<NullPartitionResult> operator()(uint64_t* indices_begin, uint64_t* indices_end,
                                          const Array& array, int64_t offset,
+                                         bool mark_duplicates,
                                          const ArraySortOptions& options,
                                          ExecContext* ctx) {
     const auto& dict_array = checked_cast<const DictionaryArray&>(array);
@@ -220,7 +256,8 @@ class ArrayCompareSorter<DictionaryType> {
     DCHECK_EQ(decoded_ranks->length(), dict_array.length());
     ARROW_ASSIGN_OR_RAISE(auto rank_sorter, GetArraySorter(*decoded_ranks->type()));
 
-    return rank_sorter(indices_begin, indices_end, *decoded_ranks, offset, options, ctx);
+    return rank_sorter(indices_begin, indices_end, *decoded_ranks, offset,
+                       mark_duplicates, options, ctx);
   }
 
  private:
@@ -267,17 +304,22 @@ class ArrayCompareSorter<StructType> {
  public:
   Result<NullPartitionResult> operator()(uint64_t* indices_begin, uint64_t* indices_end,
                                          const Array& array, int64_t offset,
+                                         bool mark_duplicates,
                                          const ArraySortOptions& options,
                                          ExecContext* ctx) {
     const auto& struct_array = checked_cast<const StructArray&>(array);
+    if (mark_duplicates) {
+      // TODO (but rank currently doesn't support struct arrays)
+      return Status::NotImplemented("Marking duplicates not supported for StructArray");
+    }
     return SortStructArray(ctx, indices_begin, indices_end, struct_array, options.order,
                            options.null_placement);
   }
 };
 
-template <typename ArrowType>
-class ArrayCountSorter {
-  using ArrayType = typename TypeTraits<ArrowType>::ArrayType;
+template <typename ArrowType, typename Base = ArraySorterMixin<ArrowType>>
+class ArrayCountSorter : Base {
+  using ArrayType = typename Base::ArrayType;
   using c_type = typename ArrowType::c_type;
 
  public:
@@ -293,16 +335,24 @@ class ArrayCountSorter {
 
   Result<NullPartitionResult> operator()(uint64_t* indices_begin, uint64_t* indices_end,
                                          const Array& array, int64_t offset,
+                                         bool mark_duplicates,
                                          const ArraySortOptions& options,
                                          ExecContext*) const {
     const auto& values = checked_cast<const ArrayType&>(array);
+    NullPartitionResult p;
 
     // 32bit counter performs much better than 64bit one
     if (values.length() < (1LL << 32)) {
-      return SortInternal<uint32_t>(indices_begin, indices_end, values, offset, options);
+      p = SortInternal<uint32_t>(indices_begin, indices_end, values, offset, options);
     } else {
-      return SortInternal<uint64_t>(indices_begin, indices_end, values, offset, options);
+      p = SortInternal<uint64_t>(indices_begin, indices_end, values, offset, options);
     }
+    if (mark_duplicates) {
+      // Perhaps we can mark duplicates slightly faster by doing it directly
+      // in EmitIndices()? It probably doesn't matter for real-world tasks.
+      Base::MarkDuplicates(p, values, offset);
+    }
+    return p;
   }
 
  private:
@@ -378,6 +428,7 @@ class ArrayCountSorter<BooleanType> {
 
   Result<NullPartitionResult> operator()(uint64_t* indices_begin, uint64_t* indices_end,
                                          const Array& array, int64_t offset,
+                                         bool mark_duplicates,
                                          const ArraySortOptions& options, ExecContext*) {
     const auto& values = checked_cast<const BooleanArray&>(array);
 
@@ -405,9 +456,31 @@ class ArrayCountSorter<BooleanType> {
     }
 
     int64_t index = offset;
-    VisitRawValuesInline(
-        *values.data(), [&](bool v) { p.non_nulls_begin[counts[v]++] = index++; },
-        [&]() { p.nulls_begin[counts[2]++] = index++; });
+    if (mark_duplicates) {
+      std::array<bool, 3> seen{};  // false, true, null (like `counts`)
+      VisitRawValuesInline(
+          *values.data(),
+          [&](bool v) {
+            if (seen[v]) {
+              p.non_nulls_begin[counts[v]++] = index++ | kDuplicateMask;
+            } else {
+              p.non_nulls_begin[counts[v]++] = index++;
+              seen[v] = true;
+            }
+          },
+          [&]() {
+            if (seen[2]) {
+              p.nulls_begin[counts[2]++] = index++ | kDuplicateMask;
+            } else {
+              p.nulls_begin[counts[2]++] = index++;
+              seen[2] = true;
+            }
+          });
+    } else {
+      VisitRawValuesInline(
+          *values.data(), [&](bool v) { p.non_nulls_begin[counts[v]++] = index++; },
+          [&]() { p.nulls_begin[counts[2]++] = index++; });
+    }
     return p;
   }
 };
@@ -423,6 +496,7 @@ class ArrayCountOrCompareSorter {
  public:
   Result<NullPartitionResult> operator()(uint64_t* indices_begin, uint64_t* indices_end,
                                          const Array& array, int64_t offset,
+                                         bool mark_duplicates,
                                          const ArraySortOptions& options,
                                          ExecContext* ctx) {
     const auto& values = checked_cast<const ArrayType&>(array);
@@ -436,11 +510,13 @@ class ArrayCountOrCompareSorter {
       if (static_cast<uint64_t>(max) - static_cast<uint64_t>(min) <=
           countsort_max_range_) {
         count_sorter_.SetMinMax(min, max);
-        return count_sorter_(indices_begin, indices_end, values, offset, options, ctx);
+        return count_sorter_(indices_begin, indices_end, values, offset, mark_duplicates,
+                             options, ctx);
       }
     }
 
-    return compare_sorter_(indices_begin, indices_end, values, offset, options, ctx);
+    return compare_sorter_(indices_begin, indices_end, values, offset, mark_duplicates,
+                           options, ctx);
   }
 
  private:
@@ -464,9 +540,17 @@ class ArrayNullSorter {
  public:
   Result<NullPartitionResult> operator()(uint64_t* indices_begin, uint64_t* indices_end,
                                          const Array& values, int64_t offset,
+                                         bool mark_duplicates,
                                          const ArraySortOptions& options, ExecContext*) {
-    return NullPartitionResult::NullsOnly(indices_begin, indices_end,
-                                          options.null_placement);
+    auto p = NullPartitionResult::NullsOnly(indices_begin, indices_end,
+                                            options.null_placement);
+    if (mark_duplicates && p.nulls_end != p.nulls_begin) {
+      auto it = p.nulls_begin;
+      while (++it != p.nulls_end) {
+        *it |= kDuplicateMask;
+      }
+    }
+    return p;
   }
 };
 
@@ -550,7 +634,9 @@ struct ArraySortIndices {
     ArrayType arr(batch[0].array.ToArrayData());
     ARROW_ASSIGN_OR_RAISE(auto sorter, GetArraySorter(*GetPhysicalType(arr.type())));
 
-    return sorter(out_begin, out_end, arr, 0, options, ctx->exec_context()).status();
+    return sorter(out_begin, out_end, arr, /*offset=*/0, /*mark_duplicates=*/false,
+                  options, ctx->exec_context())
+        .status();
   }
 };
 
@@ -561,9 +647,9 @@ Status ArraySortIndicesChunked(KernelContext* ctx, const ExecBatch& batch, Datum
   uint64_t* out_begin = out_arr->GetMutableValues<uint64_t>(1);
   uint64_t* out_end = out_begin + out_arr->length;
   std::iota(out_begin, out_end, 0);
-  return SortChunkedArray(ctx->exec_context(), out_begin, out_end,
-                          *batch[0].chunked_array(), options.order,
-                          options.null_placement)
+  return SortChunkedArray(
+             ctx->exec_context(), out_begin, out_end, *batch[0].chunked_array(),
+             /*mark_duplicates=*/false, options.order, options.null_placement)
       .status();
 }
 

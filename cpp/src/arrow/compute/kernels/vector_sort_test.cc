@@ -2236,16 +2236,20 @@ class TestRank : public ::testing::Test {
     datums_ = {chunked_array};
   }
 
-  static void AssertRank(const DatumVector& datums, SortOrder order,
-                         NullPlacement null_placement, RankOptions::Tiebreaker tiebreaker,
-                         const std::shared_ptr<Array>& expected) {
+  void AssertRank(const DatumVector& datums, SortOrder order,
+                  NullPlacement null_placement, RankOptions::Tiebreaker tiebreaker,
+                  const std::shared_ptr<Array>& expected) const {
     const std::vector<SortKey> sort_keys{SortKey("foo", order)};
     RankOptions options(sort_keys, null_placement, tiebreaker);
     ARROW_SCOPED_TRACE("options = ", options.ToString());
     for (const auto& datum : datums) {
-      ASSERT_OK_AND_ASSIGN(auto actual, CallFunction("rank", {datum}, &options));
-      ValidateOutput(actual);
-      AssertDatumsEqual(expected, actual, /*verbose=*/true);
+      if (datum.is_chunked_array() && !supports_chunked_array_) {
+        ASSERT_RAISES(NotImplemented, CallFunction("rank", {datum}, &options));
+      } else {
+        ASSERT_OK_AND_ASSIGN(auto actual, CallFunction("rank", {datum}, &options));
+        ValidateOutput(actual);
+        AssertDatumsEqual(expected, actual, /*verbose=*/true);
+      }
     }
   }
 
@@ -2255,9 +2259,9 @@ class TestRank : public ::testing::Test {
     AssertRank(datums_, order, null_placement, tiebreaker, expected);
   }
 
-  static void AssertRankEmpty(std::shared_ptr<DataType> type, SortOrder order,
-                              NullPlacement null_placement,
-                              RankOptions::Tiebreaker tiebreaker) {
+  void AssertRankEmpty(std::shared_ptr<DataType> type, SortOrder order,
+                       NullPlacement null_placement,
+                       RankOptions::Tiebreaker tiebreaker) const {
     AssertRank({ArrayFromJSON(type, "[]")}, order, null_placement, tiebreaker,
                ArrayFromJSON(uint64(), "[]"));
     AssertRank({ArrayFromJSON(type, "[null]")}, order, null_placement, tiebreaker,
@@ -2312,6 +2316,7 @@ class TestRank : public ::testing::Test {
   }
 
   DatumVector datums_;
+  bool supports_chunked_array_ = true;
 };
 
 TEST_F(TestRank, Real) {
@@ -2403,6 +2408,30 @@ TEST_F(TestRank, Bool) {
              ArrayFromJSON(uint64(), "[2, 3, 2, 1, 2, 1, 3]"));
 }
 
+TEST_F(TestRank, Null) {
+  for (auto null_placement : AllNullPlacements()) {
+    for (auto tiebreaker : AllTiebreakers()) {
+      for (auto order : AllOrders()) {
+        AssertRankEmpty(null(), order, null_placement, tiebreaker);
+      }
+    }
+  }
+
+  SetInput(ArrayFromJSON(null(), "[null, null, null]"));
+  for (auto null_placement : AllNullPlacements()) {
+    for (auto order : AllOrders()) {
+      AssertRank(order, null_placement, RankOptions::Min,
+                 ArrayFromJSON(uint64(), "[1, 1, 1]"));
+      AssertRank(order, null_placement, RankOptions::Max,
+                 ArrayFromJSON(uint64(), "[3, 3, 3]"));
+      AssertRank(order, null_placement, RankOptions::First,
+                 ArrayFromJSON(uint64(), "[1, 2, 3]"));
+      AssertRank(order, null_placement, RankOptions::Dense,
+                 ArrayFromJSON(uint64(), "[1, 1, 1]"));
+    }
+  }
+}
+
 TEST_F(TestRank, Temporal) {
   for (auto temporal_type : ::arrow::TemporalTypes()) {
     SetInput(ArrayFromJSON(temporal_type, "[2, 3, 1, 0, 5]"));
@@ -2456,6 +2485,31 @@ TEST_F(TestRank, FixedSizeBinary) {
       ArrayFromJSON(binary_type, R"(["aaa", "   ", "eee", null, "eee", null, "   "])"));
   AssertRankAllTiebreakers();
 }
+
+TEST_F(TestRank, Dictionary) {
+  // TODO change this when ChunkedArray dictionary sorting is enabled (GH-38490)
+  supports_chunked_array_ = false;
+
+  auto dict_type = dictionary(int8(), fixed_size_binary(3));
+  SetInput(DictArrayFromJSON(dict_type, "[0, 2, 1, 4, 3]",
+                             R"(["bbb", "aaa", "ccc", "ddd", "   "])"));
+  for (auto null_placement : AllNullPlacements()) {
+    for (auto tiebreaker : AllTiebreakers()) {
+      for (auto order : AllOrders()) {
+        AssertRankEmpty(dict_type, order, null_placement, tiebreaker);
+      }
+
+      AssertRankSimple(null_placement, tiebreaker);
+    }
+  }
+  // Corresponds to the same logical value as in FixedSizeBinary test above:
+  // ["aaa", "   ", "eee", null, "eee", null, "   "]
+  SetInput(DictArrayFromJSON(dict_type, "[0, 3, 4, null, 1, 2, 3]",
+                             R"(["aaa", "eee", null, "   ", "eee"])"));
+  AssertRankAllTiebreakers();
+}
+
+// TODO add tests for struct (when implemented)
 
 TEST_F(TestRank, EmptyChunks) {
   SetInput(ChunkedArrayFromJSON(int32(), {"[2, 3]", "[]", "[1, 0]", "[]", "[5]"}));

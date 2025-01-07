@@ -62,19 +62,29 @@ struct ResolvedChunk {
 // (see ChunkedIndexMapper)
 struct CompressedChunkLocation {
   static constexpr int kChunkIndexBits = 24;
-  static constexpr int KIndexInChunkBits = 64 - kChunkIndexBits;
+  static constexpr int KIndexInChunkBits = 63 - kChunkIndexBits;
 
   static constexpr uint64_t kMaxChunkIndex = (1ULL << kChunkIndexBits) - 1;
   static constexpr uint64_t kMaxIndexInChunk = (1ULL << KIndexInChunkBits) - 1;
+  // An optional bit between the two indices to mark duplicates for the rank function.
+  static constexpr uint64_t kCompressedDuplicateMask = 1ULL << kChunkIndexBits;
 
   CompressedChunkLocation() = default;
 
   constexpr uint64_t chunk_index() const { return data_ & kMaxChunkIndex; }
-  constexpr uint64_t index_in_chunk() const { return data_ >> kChunkIndexBits; }
+  constexpr uint64_t index_in_chunk() const { return data_ >> (kChunkIndexBits + 1); }
+  constexpr bool is_duplicate() const { return (data_ & kCompressedDuplicateMask) != 0; }
+
+  // Turn the duplicate bit into a duplicate mask for logical indices
+  constexpr uint64_t logical_duplicate_mask() const {
+    return (data_ & kCompressedDuplicateMask) << (63 - kChunkIndexBits);
+  }
+
+  void MarkDuplicate() { data_ |= kCompressedDuplicateMask; }
 
   explicit constexpr CompressedChunkLocation(uint64_t chunk_index,
                                              uint64_t index_in_chunk)
-      : data_((index_in_chunk << kChunkIndexBits) | chunk_index) {}
+      : data_((index_in_chunk << (kChunkIndexBits + 1)) | chunk_index) {}
 
   template <typename IndexType>
   explicit operator TypedChunkLocation<IndexType>() {
