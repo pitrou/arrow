@@ -144,6 +144,7 @@ cdef class ParquetFileFormat(FileFormat):
                 options.dict_columns.insert(tobytes(column))
         options.coerce_int96_timestamp_unit = \
             read_options._coerce_int96_timestamp_unit
+        options.binary_type = read_options._binary_type
 
         self.init(<shared_ptr[CFileFormat]> wrapped)
         self.default_fragment_scan_options = default_fragment_scan_options
@@ -184,6 +185,7 @@ cdef class ParquetFileFormat(FileFormat):
         # the private property which uses the C Type
         parquet_read_options._coerce_int96_timestamp_unit = \
             options.coerce_int96_timestamp_unit
+        parquet_read_options._binary_type = options.binary_type
         return parquet_read_options
 
     def make_write_options(self, **kwargs):
@@ -510,17 +512,33 @@ cdef class ParquetReadOptions(_Weakrefable):
         resolution (e.g. 'ms'). Setting to None is equivalent to 'ns'
         and therefore INT96 timestamps will be inferred as timestamps
         in nanoseconds
+    binary_type : XXX
+        TODO
     """
 
     cdef public:
         set dictionary_columns
         TimeUnit _coerce_int96_timestamp_unit
+        Type _binary_type
 
     # Also see _PARQUET_READ_OPTIONS
     def __init__(self, dictionary_columns=None,
-                 coerce_int96_timestamp_unit=None):
+                 coerce_int96_timestamp_unit=None,
+                 binary_type=None):
         self.dictionary_columns = set(dictionary_columns or set())
         self.coerce_int96_timestamp_unit = coerce_int96_timestamp_unit
+        self.binary_type = binary_type
+
+    @property
+    def binary_type(self):
+        return primitive_type(self._binary_type)
+
+    @binary_type.setter
+    def binary_type(self, ty):
+        if ty is not None:
+            self._binary_type = pyarrow_unwrap_data_type(ty).get().id()
+        else:
+            self._binary_type = _Type_BINARY
 
     @property
     def coerce_int96_timestamp_unit(self):
@@ -675,7 +693,7 @@ cdef class ParquetFileWriteOptions(FileWriteOptions):
 
 
 cdef set _PARQUET_READ_OPTIONS = {
-    'dictionary_columns', 'coerce_int96_timestamp_unit'
+    'dictionary_columns', 'coerce_int96_timestamp_unit', 'binary_type'
 }
 
 
