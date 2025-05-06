@@ -22,6 +22,7 @@
 #include <memory>
 #include <vector>
 
+#include "arrow/array/builder_base.h"
 #include "arrow/type_fwd.h"
 
 #include "parquet/exception.h"
@@ -126,11 +127,11 @@ struct EncodingTraits<ByteArrayType> {
   using Encoder = ByteArrayEncoder;
   using Decoder = ByteArrayDecoder;
 
-  using ArrowType = ::arrow::BinaryType;
+  // using ArrowType = ::arrow::BinaryType;
   /// \brief Internal helper class for decoding BYTE_ARRAY data where we can
   /// overflow the capacity of a single arrow::BinaryArray
   struct Accumulator {
-    std::unique_ptr<::arrow::BinaryBuilder> builder;
+    std::unique_ptr<::arrow::ArrayBuilder> builder;
     std::vector<std::shared_ptr<::arrow::Array>> chunks;
   };
   using DictAccumulator = ::arrow::Dictionary32Builder<::arrow::BinaryType>;

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include "arrow/type.h"
 #include "parquet/encoding.h"
 
 #include <algorithm>
@@ -24,6 +25,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -62,6 +64,238 @@ using arrow::util::SafeLoadAs;
 
 namespace parquet {
 namespace {
+
+// A helper class to abstract away differences between EncodingTraits<DType>::Accumulator
+// for ByteArrayType and FLBAType.
+
+template <typename DType, typename ArrowType>
+struct ArrowBinaryHelper;
+
+template <>
+struct ArrowBinaryHelper<ByteArrayType, ::arrow::BinaryType> {
+  using Accumulator = typename EncodingTraits<ByteArrayType>::Accumulator;
+
+  ArrowBinaryHelper(Accumulator* acc, int64_t length)
+      : acc_(acc),
+        builder_(checked_cast<::arrow::BinaryBuilder*>(acc->builder.get())),
+        entries_remaining_(length),
+        chunk_space_remaining_(::arrow::kBinaryMemoryLimit -
+                               builder_->value_data_length()) {}
+
+  // Prepare will reserve the number of entries remaining in the current chunk.
+  // If estimated_data_length is provided, it will also reserve the estimated data length.
+  Status Prepare(std::optional<int64_t> estimated_data_length = {}) {
+    RETURN_NOT_OK(builder_->Reserve(entries_remaining_));
+    if (estimated_data_length.has_value()) {
+      RETURN_NOT_OK(builder_->ReserveData(
+          std::min<int64_t>(*estimated_data_length, this->chunk_space_remaining_)));
+    }
+    return Status::OK();
+  }
+
+  Status PrepareNextInput(int64_t next_value_length) {
+    if (ARROW_PREDICT_FALSE(!CanFit(next_value_length))) {
+      // This element would exceed the capacity of a chunk
+      RETURN_NOT_OK(PushChunk());
+      // TODO is this right? It seems it would over-reserve
+      RETURN_NOT_OK(builder_->Reserve(entries_remaining_));
+    }
+    return Status::OK();
+  }
+
+  // If a new chunk is created and estimated_remaining_data_length is provided,
+  // it will also reserve the estimated data length for this chunk.
+  Status PrepareNextInput(int64_t next_value_length,
+                          int64_t estimated_remaining_data_length) {
+    if (ARROW_PREDICT_FALSE(!CanFit(next_value_length))) {
+      // This element would exceed the capacity of a chunk
+      RETURN_NOT_OK(PushChunk());
+      RETURN_NOT_OK(builder_->Reserve(entries_remaining_));
+      if (estimated_remaining_data_length) {
+        RETURN_NOT_OK(builder_->ReserveData(
+            std::min<int64_t>(estimated_remaining_data_length, chunk_space_remaining_)));
+      }
+    }
+    return Status::OK();
+  }
+
+  void UnsafeAppend(const uint8_t* data, int32_t length) {
+    DCHECK(CanFit(length));
+    DCHECK_GT(entries_remaining_, 0);
+    chunk_space_remaining_ -= length;
+    --entries_remaining_;
+    builder_->UnsafeAppend(data, length);
+  }
+
+  Status Append(const uint8_t* data, int32_t length) {
+    DCHECK(CanFit(length));
+    DCHECK_GT(entries_remaining_, 0);
+    chunk_space_remaining_ -= length;
+    --entries_remaining_;
+    return builder_->Append(data, length);
+  }
+
+  void UnsafeAppendNull() {
+    --entries_remaining_;
+    builder_->UnsafeAppendNull();
+  }
+
+  Status AppendNull() {
+    --entries_remaining_;
+    return builder_->AppendNull();
+  }
+
+ private:
+  Status PushChunk() {
+    ARROW_ASSIGN_OR_RAISE(auto chunk, acc_->builder->Finish());
+    acc_->chunks.push_back(std::move(chunk));
+    chunk_space_remaining_ = ::arrow::kBinaryMemoryLimit;
+    return Status::OK();
+  }
+
+  bool CanFit(int64_t length) const { return length <= chunk_space_remaining_; }
+
+  Accumulator* acc_;
+  ::arrow::BinaryBuilder* builder_;
+  int64_t entries_remaining_;
+  int64_t chunk_space_remaining_;
+};
+
+template <>
+struct ArrowBinaryHelper<ByteArrayType, ::arrow::LargeBinaryType> {
+  using Accumulator = typename EncodingTraits<ByteArrayType>::Accumulator;
+
+  ArrowBinaryHelper(Accumulator* acc, int64_t length)
+      : builder_(checked_cast<::arrow::LargeBinaryBuilder*>(acc->builder.get())),
+        entries_remaining_(length) {}
+
+  // Prepare will reserve the number of entries remaining in the current chunk.
+  // If estimated_data_length is provided, it will also reserve the estimated data length,
+  // and the caller should better call `UnsafeAppend` instead of `Append` to avoid
+  // double-checking the data length.
+  Status Prepare(std::optional<int64_t> estimated_data_length = {}) {
+    RETURN_NOT_OK(builder_->Reserve(entries_remaining_));
+    if (estimated_data_length.has_value()) {
+      RETURN_NOT_OK(builder_->ReserveData(*estimated_data_length));
+    }
+    return Status::OK();
+  }
+
+  Status PrepareNextInput(int64_t next_value_length) { return Status::OK(); }
+
+  Status PrepareNextInput(int64_t next_value_length,
+                          int64_t estimated_remaining_data_length) {
+    return Status::OK();
+  }
+
+  // TODO is it useful to update entries_remaining_ in non-debug mode below?
+
+  void UnsafeAppend(const uint8_t* data, int32_t length) {
+    DCHECK_GT(entries_remaining_, 0);
+    --entries_remaining_;
+    builder_->UnsafeAppend(data, length);
+  }
+
+  Status Append(const uint8_t* data, int32_t length) {
+    DCHECK_GT(entries_remaining_, 0);
+    --entries_remaining_;
+    return builder_->Append(data, length);
+  }
+
+  void UnsafeAppendNull() {
+    --entries_remaining_;
+    builder_->UnsafeAppendNull();
+  }
+
+  Status AppendNull() {
+    --entries_remaining_;
+    return builder_->AppendNull();
+  }
+
+ private:
+  ::arrow::LargeBinaryBuilder* builder_;
+  int64_t entries_remaining_;
+};
+
+template <>
+struct ArrowBinaryHelper<FLBAType, ::arrow::FixedSizeBinaryType> {
+  using Accumulator = typename EncodingTraits<FLBAType>::Accumulator;
+
+  ArrowBinaryHelper(Accumulator* acc, int64_t length)
+      : acc_(acc), entries_remaining_(length) {}
+
+  Status Prepare(std::optional<int64_t> estimated_data_length = {}) {
+    return acc_->Reserve(entries_remaining_);
+  }
+
+  Status PrepareNextInput(int64_t next_value_length) { return Status::OK(); }
+
+  Status PrepareNextInput(int64_t next_value_length,
+                          int64_t estimated_remaining_data_length) {
+    return Status::OK();
+  }
+
+  // TODO is it useful to update entries_remaining_ in non-debug mode below?
+
+  void UnsafeAppend(const uint8_t* data, int32_t length) {
+    DCHECK_GT(entries_remaining_, 0);
+    --entries_remaining_;
+    acc_->UnsafeAppend(data);
+  }
+
+  Status Append(const uint8_t* data, int32_t length) {
+    DCHECK_GT(entries_remaining_, 0);
+    --entries_remaining_;
+    return acc_->Append(data);
+  }
+
+  void UnsafeAppendNull() {
+    --entries_remaining_;
+    acc_->UnsafeAppendNull();
+  }
+
+  Status AppendNull() {
+    --entries_remaining_;
+    return acc_->AppendNull();
+  }
+
+ private:
+  Accumulator* acc_;
+  int64_t entries_remaining_;
+};
+
+// Call `func(&helper, args...)` where `helper` is a ArrowBinaryHelper<> instance
+// suitable for the Parquet DType and accumulator `acc`.
+template <typename DType, typename Function, typename... Args>
+auto DispatchArrowBinaryHelper(typename EncodingTraits<DType>::Accumulator* acc,
+                               int64_t length, Function&& func, Args&&... args) {
+  static_assert(std::is_same_v<DType, ByteArrayType> || std::is_same_v<DType, FLBAType>,
+                "unsupported DType");
+  if constexpr (std::is_same_v<DType, ByteArrayType>) {
+    switch (acc->builder->type()->id()) {
+      case ::arrow::Type::BINARY:
+      case ::arrow::Type::STRING: {
+        ArrowBinaryHelper<DType, ::arrow::BinaryType> helper(acc, length);
+        return func(&helper, std::forward<Args>(args)...);
+      }
+      case ::arrow::Type::LARGE_BINARY:
+      case ::arrow::Type::LARGE_STRING: {
+        ArrowBinaryHelper<DType, ::arrow::LargeBinaryType> helper(acc, length);
+        return func(&helper, std::forward<Args>(args)...);
+      }
+      // TODO BINARY_VIEW
+      default:
+        throw ParquetException(
+            "Unsupported Arrow builder type when reading from BYTE_ARRAY column: " +
+            acc->builder->type()->ToString());
+    }
+  } else {
+    ArrowBinaryHelper<DType, ::arrow::FixedSizeBinaryType> helper(acc, length);
+    return func(&helper, std::forward<Args>(args)...);
+  }
+}
+
+// Internal decoder class hierarchy
 
 class DecoderImpl : virtual public Decoder {
  public:
@@ -416,146 +650,6 @@ int PlainBooleanDecoder::Decode(bool* buffer, int max_values) {
 
 // PLAIN decoder implementation for FIXED_LEN_BYTE_ARRAY and BYTE_ARRAY
 
-// A helper class to abstract away differences between EncodingTraits<DType>::Accumulator
-// for ByteArrayType and FLBAType.
-template <typename DType>
-struct ArrowBinaryHelper;
-
-template <>
-struct ArrowBinaryHelper<ByteArrayType> {
-  using Accumulator = typename EncodingTraits<ByteArrayType>::Accumulator;
-
-  ArrowBinaryHelper(Accumulator* acc, int64_t length)
-      : acc_(acc),
-        entries_remaining_(length),
-        chunk_space_remaining_(::arrow::kBinaryMemoryLimit -
-                               acc_->builder->value_data_length()) {}
-
-  // Prepare will reserve the number of entries remaining in the current chunk.
-  // If estimated_data_length is provided, it will also reserve the estimated data length,
-  // and the caller should better call `UnsafeAppend` instead of `Append` to avoid
-  // double-checking the data length.
-  Status Prepare(std::optional<int64_t> estimated_data_length = {}) {
-    RETURN_NOT_OK(acc_->builder->Reserve(entries_remaining_));
-    if (estimated_data_length.has_value()) {
-      RETURN_NOT_OK(acc_->builder->ReserveData(
-          std::min<int64_t>(*estimated_data_length, this->chunk_space_remaining_)));
-    }
-    return Status::OK();
-  }
-
-  Status PrepareNextInput(int64_t next_value_length) {
-    if (ARROW_PREDICT_FALSE(!CanFit(next_value_length))) {
-      // This element would exceed the capacity of a chunk
-      RETURN_NOT_OK(PushChunk());
-      RETURN_NOT_OK(acc_->builder->Reserve(entries_remaining_));
-    }
-    return Status::OK();
-  }
-
-  // If estimated_remaining_data_length is provided, it will also reserve the estimated
-  // data length, and the caller should better call `UnsafeAppend` instead of
-  // `Append` to avoid double-checking the data length.
-  Status PrepareNextInput(int64_t next_value_length,
-                          int64_t estimated_remaining_data_length) {
-    if (ARROW_PREDICT_FALSE(!CanFit(next_value_length))) {
-      // This element would exceed the capacity of a chunk
-      RETURN_NOT_OK(PushChunk());
-      RETURN_NOT_OK(acc_->builder->Reserve(entries_remaining_));
-      if (estimated_remaining_data_length) {
-        RETURN_NOT_OK(acc_->builder->ReserveData(
-            std::min<int64_t>(estimated_remaining_data_length, chunk_space_remaining_)));
-      }
-    }
-    return Status::OK();
-  }
-
-  void UnsafeAppend(const uint8_t* data, int32_t length) {
-    DCHECK(CanFit(length));
-    DCHECK_GT(entries_remaining_, 0);
-    chunk_space_remaining_ -= length;
-    --entries_remaining_;
-    acc_->builder->UnsafeAppend(data, length);
-  }
-
-  Status Append(const uint8_t* data, int32_t length) {
-    DCHECK(CanFit(length));
-    DCHECK_GT(entries_remaining_, 0);
-    chunk_space_remaining_ -= length;
-    --entries_remaining_;
-    return acc_->builder->Append(data, length);
-  }
-
-  void UnsafeAppendNull() {
-    --entries_remaining_;
-    acc_->builder->UnsafeAppendNull();
-  }
-
-  Status AppendNull() {
-    --entries_remaining_;
-    return acc_->builder->AppendNull();
-  }
-
- private:
-  Status PushChunk() {
-    ARROW_ASSIGN_OR_RAISE(auto chunk, acc_->builder->Finish());
-    acc_->chunks.push_back(std::move(chunk));
-    chunk_space_remaining_ = ::arrow::kBinaryMemoryLimit;
-    return Status::OK();
-  }
-
-  bool CanFit(int64_t length) const { return length <= chunk_space_remaining_; }
-
-  Accumulator* acc_;
-  int64_t entries_remaining_;
-  int64_t chunk_space_remaining_;
-};
-
-template <>
-struct ArrowBinaryHelper<FLBAType> {
-  using Accumulator = typename EncodingTraits<FLBAType>::Accumulator;
-
-  ArrowBinaryHelper(Accumulator* acc, int64_t length)
-      : acc_(acc), entries_remaining_(length) {}
-
-  Status Prepare(std::optional<int64_t> estimated_data_length = {}) {
-    return acc_->Reserve(entries_remaining_);
-  }
-
-  Status PrepareNextInput(int64_t next_value_length) { return Status::OK(); }
-
-  Status PrepareNextInput(int64_t next_value_length,
-                          int64_t estimated_remaining_data_length) {
-    return Status::OK();
-  }
-
-  void UnsafeAppend(const uint8_t* data, int32_t length) {
-    DCHECK_GT(entries_remaining_, 0);
-    --entries_remaining_;
-    acc_->UnsafeAppend(data);
-  }
-
-  Status Append(const uint8_t* data, int32_t length) {
-    DCHECK_GT(entries_remaining_, 0);
-    --entries_remaining_;
-    return acc_->Append(data);
-  }
-
-  void UnsafeAppendNull() {
-    --entries_remaining_;
-    acc_->UnsafeAppendNull();
-  }
-
-  Status AppendNull() {
-    --entries_remaining_;
-    return acc_->AppendNull();
-  }
-
- private:
-  Accumulator* acc_;
-  int64_t entries_remaining_;
-};
-
 template <>
 inline int PlainDecoder<ByteArrayType>::DecodeArrow(
     int num_values, int null_count, const uint8_t* valid_bits, int64_t valid_bits_offset,
@@ -654,43 +748,44 @@ class PlainByteArrayDecoder : public PlainDecoder<ByteArrayType>,
                           int64_t valid_bits_offset,
                           typename EncodingTraits<ByteArrayType>::Accumulator* out,
                           int* out_values_decoded) {
-    ArrowBinaryHelper<ByteArrayType> helper(out, num_values);
-    int values_decoded = 0;
+    auto visit_binary_helper = [&](auto* helper) {
+      int values_decoded = 0;
 
-    RETURN_NOT_OK(helper.Prepare(len_));
+      RETURN_NOT_OK(helper->Prepare(len_));
 
-    int i = 0;
-    RETURN_NOT_OK(VisitNullBitmapInline(
-        valid_bits, valid_bits_offset, num_values, null_count,
-        [&]() {
-          if (ARROW_PREDICT_FALSE(len_ < 4)) {
-            ParquetException::EofException();
-          }
-          auto value_len = SafeLoadAs<int32_t>(data_);
-          if (ARROW_PREDICT_FALSE(value_len < 0 || value_len > INT32_MAX - 4)) {
-            return Status::Invalid("Invalid or corrupted value_len '", value_len, "'");
-          }
-          auto increment = value_len + 4;
-          if (ARROW_PREDICT_FALSE(len_ < increment)) {
-            ParquetException::EofException();
-          }
-          RETURN_NOT_OK(helper.PrepareNextInput(value_len, len_));
-          helper.UnsafeAppend(data_ + 4, value_len);
-          data_ += increment;
-          len_ -= increment;
-          ++values_decoded;
-          ++i;
-          return Status::OK();
-        },
-        [&]() {
-          helper.UnsafeAppendNull();
-          ++i;
-          return Status::OK();
-        }));
+      RETURN_NOT_OK(VisitNullBitmapInline(
+          valid_bits, valid_bits_offset, num_values, null_count,
+          [&]() {
+            // TODO replace exceptions with Status returns
+            if (ARROW_PREDICT_FALSE(len_ < 4)) {
+              ParquetException::EofException();
+            }
+            auto value_len = SafeLoadAs<int32_t>(data_);
+            if (ARROW_PREDICT_FALSE(value_len < 0 || value_len > INT32_MAX - 4)) {
+              return Status::Invalid("Invalid or corrupted value_len '", value_len, "'");
+            }
+            auto increment = value_len + 4;
+            if (ARROW_PREDICT_FALSE(len_ < increment)) {
+              ParquetException::EofException();
+            }
+            RETURN_NOT_OK(helper->PrepareNextInput(value_len, len_));
+            helper->UnsafeAppend(data_ + 4, value_len);
+            data_ += increment;
+            len_ -= increment;
+            ++values_decoded;
+            return Status::OK();
+          },
+          [&]() {
+            helper->UnsafeAppendNull();
+            return Status::OK();
+          }));
 
-    num_values_ -= values_decoded;
-    *out_values_decoded = values_decoded;
-    return Status::OK();
+      num_values_ -= values_decoded;
+      *out_values_decoded = values_decoded;
+      return Status::OK();
+    };
+
+    return DispatchArrowBinaryHelper<ByteArrayType>(out, num_values, visit_binary_helper);
   }
 
   template <typename BuilderType>
@@ -1161,101 +1256,106 @@ class DictByteArrayDecoderImpl : public DictDecoderImpl<ByteArrayType>,
     constexpr int32_t kBufferSize = 1024;
     int32_t indices[kBufferSize];
 
-    ArrowBinaryHelper<ByteArrayType> helper(out, num_values);
-    // The `len_` in the ByteArrayDictDecoder is the total length of the
-    // RLE/Bit-pack encoded data size, so, we cannot use `len_` to reserve
-    // space for binary data.
-    RETURN_NOT_OK(helper.Prepare());
+    auto visit_binary_helper = [&](auto* helper) {
+      // The `len_` in the ByteArrayDictDecoder is the total length of the
+      // RLE/Bit-pack encoded data size, so, we cannot use `len_` to reserve
+      // space for binary data.
+      RETURN_NOT_OK(helper->Prepare());
 
-    const auto* dict_values = dictionary_->data_as<ByteArray>();
-    int values_decoded = 0;
-    int num_indices = 0;
-    int pos_indices = 0;
+      const auto* dict_values = dictionary_->data_as<ByteArray>();
+      int values_decoded = 0;
+      int num_indices = 0;
+      int pos_indices = 0;
 
-    auto visit_valid = [&](int64_t position) -> Status {
-      if (num_indices == pos_indices) {
-        // Refill indices buffer
-        const auto batch_size =
-            std::min<int32_t>(kBufferSize, num_values - null_count - values_decoded);
-        num_indices = idx_decoder_.GetBatch(indices, batch_size);
-        if (ARROW_PREDICT_FALSE(num_indices < 1)) {
-          return Status::Invalid("Invalid number of indices: ", num_indices);
+      auto visit_valid = [&](int64_t position) -> Status {
+        if (num_indices == pos_indices) {
+          // Refill indices buffer
+          const auto batch_size =
+              std::min<int32_t>(kBufferSize, num_values - null_count - values_decoded);
+          num_indices = idx_decoder_.GetBatch(indices, batch_size);
+          if (ARROW_PREDICT_FALSE(num_indices < 1)) {
+            return Status::Invalid("Invalid number of indices: ", num_indices);
+          }
+          pos_indices = 0;
         }
-        pos_indices = 0;
-      }
-      const auto index = indices[pos_indices++];
-      RETURN_NOT_OK(IndexInBounds(index));
-      const auto& val = dict_values[index];
-      RETURN_NOT_OK(helper.PrepareNextInput(val.len));
-      RETURN_NOT_OK(helper.Append(val.ptr, static_cast<int32_t>(val.len)));
-      ++values_decoded;
-      return Status::OK();
-    };
+        const auto index = indices[pos_indices++];
+        RETURN_NOT_OK(IndexInBounds(index));
+        const auto& val = dict_values[index];
+        RETURN_NOT_OK(helper->PrepareNextInput(val.len));
+        RETURN_NOT_OK(helper->Append(val.ptr, static_cast<int32_t>(val.len)));
+        ++values_decoded;
+        return Status::OK();
+      };
 
-    auto visit_null = [&]() -> Status {
-      RETURN_NOT_OK(helper.AppendNull());
-      return Status::OK();
-    };
+      auto visit_null = [&]() -> Status {
+        RETURN_NOT_OK(helper->AppendNull());
+        return Status::OK();
+      };
 
-    ::arrow::internal::BitBlockCounter bit_blocks(valid_bits, valid_bits_offset,
-                                                  num_values);
-    int64_t position = 0;
-    while (position < num_values) {
-      const auto block = bit_blocks.NextWord();
-      if (block.AllSet()) {
-        for (int64_t i = 0; i < block.length; ++i, ++position) {
-          ARROW_RETURN_NOT_OK(visit_valid(position));
-        }
-      } else if (block.NoneSet()) {
-        for (int64_t i = 0; i < block.length; ++i, ++position) {
-          ARROW_RETURN_NOT_OK(visit_null());
-        }
-      } else {
-        for (int64_t i = 0; i < block.length; ++i, ++position) {
-          if (bit_util::GetBit(valid_bits, valid_bits_offset + position)) {
+      // TODO perhaps switch to BitRunReader and unify with DecodeArrowDenseNonNull?
+      ::arrow::internal::BitBlockCounter bit_blocks(valid_bits, valid_bits_offset,
+                                                    num_values);
+      int64_t position = 0;
+      while (position < num_values) {
+        const auto block = bit_blocks.NextWord();
+        if (block.AllSet()) {
+          for (int64_t i = 0; i < block.length; ++i, ++position) {
             ARROW_RETURN_NOT_OK(visit_valid(position));
-          } else {
+          }
+        } else if (block.NoneSet()) {
+          for (int64_t i = 0; i < block.length; ++i, ++position) {
             ARROW_RETURN_NOT_OK(visit_null());
+          }
+        } else {
+          for (int64_t i = 0; i < block.length; ++i, ++position) {
+            if (bit_util::GetBit(valid_bits, valid_bits_offset + position)) {
+              ARROW_RETURN_NOT_OK(visit_valid(position));
+            } else {
+              ARROW_RETURN_NOT_OK(visit_null());
+            }
           }
         }
       }
-    }
 
-    *out_num_values = values_decoded;
-    return Status::OK();
+      *out_num_values = values_decoded;
+      return Status::OK();
+    };
+    return DispatchArrowBinaryHelper<ByteArrayType>(out, num_values, visit_binary_helper);
   }
 
   Status DecodeArrowDenseNonNull(int num_values,
                                  typename EncodingTraits<ByteArrayType>::Accumulator* out,
                                  int* out_num_values) {
-    constexpr int32_t kBufferSize = 2048;
-    int32_t indices[kBufferSize];
-    int values_decoded = 0;
+    auto visit_binary_helper = [&](auto* helper) {
+      constexpr int32_t kBufferSize = 2048;
+      int32_t indices[kBufferSize];
+      int values_decoded = 0;
 
-    ArrowBinaryHelper<ByteArrayType> helper(out, num_values);
-    // The `len_` in the ByteArrayDictDecoder is the total length of the
-    // RLE/Bit-pack encoded data size, so, we cannot use `len_` to reserve
-    // space for binary data.
-    RETURN_NOT_OK(helper.Prepare());
+      // The `len_` in the ByteArrayDictDecoder is the total length of the
+      // RLE/Bit-pack encoded data size, so, we cannot use `len_` to reserve
+      // space for binary data.
+      RETURN_NOT_OK(helper->Prepare());
 
-    const auto* dict_values = dictionary_->data_as<ByteArray>();
+      const auto* dict_values = dictionary_->data_as<ByteArray>();
 
-    while (values_decoded < num_values) {
-      const int32_t batch_size =
-          std::min<int32_t>(kBufferSize, num_values - values_decoded);
-      const int num_indices = idx_decoder_.GetBatch(indices, batch_size);
-      if (num_indices == 0) ParquetException::EofException();
-      for (int i = 0; i < num_indices; ++i) {
-        auto idx = indices[i];
-        RETURN_NOT_OK(IndexInBounds(idx));
-        const auto& val = dict_values[idx];
-        RETURN_NOT_OK(helper.PrepareNextInput(val.len));
-        RETURN_NOT_OK(helper.Append(val.ptr, static_cast<int32_t>(val.len)));
+      while (values_decoded < num_values) {
+        const int32_t batch_size =
+            std::min<int32_t>(kBufferSize, num_values - values_decoded);
+        const int num_indices = idx_decoder_.GetBatch(indices, batch_size);
+        if (num_indices == 0) ParquetException::EofException();
+        for (int i = 0; i < num_indices; ++i) {
+          auto idx = indices[i];
+          RETURN_NOT_OK(IndexInBounds(idx));
+          const auto& val = dict_values[idx];
+          RETURN_NOT_OK(helper->PrepareNextInput(val.len));
+          RETURN_NOT_OK(helper->Append(val.ptr, static_cast<int32_t>(val.len)));
+        }
+        values_decoded += num_indices;
       }
-      values_decoded += num_indices;
-    }
-    *out_num_values = values_decoded;
-    return Status::OK();
+      *out_num_values = values_decoded;
+      return Status::OK();
+    };
+    return DispatchArrowBinaryHelper<ByteArrayType>(out, num_values, visit_binary_helper);
   }
 
   template <typename BuilderType>
@@ -1679,37 +1779,39 @@ class DeltaLengthByteArrayDecoder : public DecoderImpl,
                           int64_t valid_bits_offset,
                           typename EncodingTraits<ByteArrayType>::Accumulator* out,
                           int* out_num_values) {
-    ArrowBinaryHelper<ByteArrayType> helper(out, num_values);
-    RETURN_NOT_OK(helper.Prepare());
+    auto visit_binary_helper = [&](auto* helper) {
+      RETURN_NOT_OK(helper->Prepare());
 
-    std::vector<ByteArray> values(num_values - null_count);
-    const int num_valid_values = Decode(values.data(), num_values - null_count);
-    if (ARROW_PREDICT_FALSE(num_values - null_count != num_valid_values)) {
-      throw ParquetException("Expected to decode ", num_values - null_count,
-                             " values, but decoded ", num_valid_values, " values.");
-    }
+      std::vector<ByteArray> values(num_values - null_count);
+      const int num_valid_values = Decode(values.data(), num_values - null_count);
+      if (ARROW_PREDICT_FALSE(num_values - null_count != num_valid_values)) {
+        throw ParquetException("Expected to decode ", num_values - null_count,
+                               " values, but decoded ", num_valid_values, " values.");
+      }
 
-    auto values_ptr = values.data();
-    int value_idx = 0;
+      auto values_ptr = values.data();
+      int value_idx = 0;
 
-    RETURN_NOT_OK(VisitNullBitmapInline(
-        valid_bits, valid_bits_offset, num_values, null_count,
-        [&]() {
-          const auto& val = values_ptr[value_idx];
-          RETURN_NOT_OK(helper.PrepareNextInput(val.len));
-          RETURN_NOT_OK(helper.Append(val.ptr, static_cast<int32_t>(val.len)));
-          ++value_idx;
-          return Status::OK();
-        },
-        [&]() {
-          RETURN_NOT_OK(helper.AppendNull());
-          --null_count;
-          return Status::OK();
-        }));
+      RETURN_NOT_OK(VisitNullBitmapInline(
+          valid_bits, valid_bits_offset, num_values, null_count,
+          [&]() {
+            const auto& val = values_ptr[value_idx];
+            RETURN_NOT_OK(helper->PrepareNextInput(val.len));
+            RETURN_NOT_OK(helper->Append(val.ptr, static_cast<int32_t>(val.len)));
+            ++value_idx;
+            return Status::OK();
+          },
+          [&]() {
+            RETURN_NOT_OK(helper->AppendNull());
+            --null_count;
+            return Status::OK();
+          }));
 
-    DCHECK_EQ(null_count, 0);
-    *out_num_values = num_valid_values;
-    return Status::OK();
+      DCHECK_EQ(null_count, 0);
+      *out_num_values = num_valid_values;
+      return Status::OK();
+    };
+    return DispatchArrowBinaryHelper<ByteArrayType>(out, num_values, visit_binary_helper);
   }
 
   std::shared_ptr<::arrow::bit_util::BitReader> decoder_;
@@ -2005,34 +2107,36 @@ class DeltaByteArrayDecoderImpl : public DecoderImpl, public TypedDecoderImpl<DT
                           int64_t valid_bits_offset,
                           typename EncodingTraits<DType>::Accumulator* out,
                           int* out_num_values) {
-    ArrowBinaryHelper<DType> helper(out, num_values);
-    RETURN_NOT_OK(helper.Prepare());
+    auto visit_binary_helper = [&](auto* helper) {
+      RETURN_NOT_OK(helper->Prepare());
 
-    std::vector<ByteArray> values(num_values);
-    const int num_valid_values = GetInternal(values.data(), num_values - null_count);
-    DCHECK_EQ(num_values - null_count, num_valid_values);
+      std::vector<ByteArray> values(num_values);
+      const int num_valid_values = GetInternal(values.data(), num_values - null_count);
+      DCHECK_EQ(num_values - null_count, num_valid_values);
 
-    auto values_ptr = reinterpret_cast<const ByteArray*>(values.data());
-    int value_idx = 0;
+      auto values_ptr = reinterpret_cast<const ByteArray*>(values.data());
+      int value_idx = 0;
 
-    RETURN_NOT_OK(VisitNullBitmapInline(
-        valid_bits, valid_bits_offset, num_values, null_count,
-        [&]() {
-          const auto& val = values_ptr[value_idx];
-          RETURN_NOT_OK(helper.PrepareNextInput(val.len));
-          RETURN_NOT_OK(helper.Append(val.ptr, static_cast<int32_t>(val.len)));
-          ++value_idx;
-          return Status::OK();
-        },
-        [&]() {
-          RETURN_NOT_OK(helper.AppendNull());
-          --null_count;
-          return Status::OK();
-        }));
+      RETURN_NOT_OK(VisitNullBitmapInline(
+          valid_bits, valid_bits_offset, num_values, null_count,
+          [&]() {
+            const auto& val = values_ptr[value_idx];
+            RETURN_NOT_OK(helper->PrepareNextInput(val.len));
+            RETURN_NOT_OK(helper->Append(val.ptr, static_cast<int32_t>(val.len)));
+            ++value_idx;
+            return Status::OK();
+          },
+          [&]() {
+            RETURN_NOT_OK(helper->AppendNull());
+            --null_count;
+            return Status::OK();
+          }));
 
-    DCHECK_EQ(null_count, 0);
-    *out_num_values = num_valid_values;
-    return Status::OK();
+      DCHECK_EQ(null_count, 0);
+      *out_num_values = num_valid_values;
+      return Status::OK();
+    };
+    return DispatchArrowBinaryHelper<DType>(out, num_values, visit_binary_helper);
   }
 
   MemoryPool* pool_;

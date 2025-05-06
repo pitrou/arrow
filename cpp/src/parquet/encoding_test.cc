@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "arrow/array.h"
+#include "arrow/array/builder_base.h"
 #include "arrow/array/builder_binary.h"
 #include "arrow/array/builder_dict.h"
 #include "arrow/array/concatenate.h"
@@ -2351,9 +2352,8 @@ TYPED_TEST(TestDeltaByteArrayEncoding, BasicRoundTrip) {
 
 template <typename Type>
 class TestDeltaByteArrayEncodingDirectPut : public TestEncodingBase<Type> {
-  using ArrowType = typename EncodingTraits<Type>::ArrowType;
   using Accumulator = typename EncodingTraits<Type>::Accumulator;
-  using BuilderType = typename ::arrow::TypeTraits<ArrowType>::BuilderType;
+  // using BuilderType = typename ::arrow::TypeTraits<ArrowType>::BuilderType;
 
  public:
   std::unique_ptr<TypedEncoder<Type>> encoder =
@@ -2379,7 +2379,7 @@ void TestDeltaByteArrayEncodingDirectPut<ByteArrayType>::CheckDirectPut(
   decoder->SetData(num_values, buf->data(), static_cast<int>(buf->size()));
 
   Accumulator acc;
-  acc.builder = std::make_unique<BuilderType>(array->type(), default_memory_pool());
+  ASSERT_OK_AND_ASSIGN(acc.builder, ::arrow::MakeBuilder(array->type()));
 
   ASSERT_EQ(num_values,
             decoder->DecodeArrow(static_cast<int>(array->length()),

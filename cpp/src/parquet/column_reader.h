@@ -22,6 +22,7 @@
 #include <utility>
 #include <vector>
 
+#include "arrow/type_fwd.h"
 #include "parquet/exception.h"
 #include "parquet/level_conversion.h"
 #include "parquet/metadata.h"
@@ -31,9 +32,6 @@
 #include "parquet/types.h"
 
 namespace arrow {
-
-class Array;
-class ChunkedArray;
 
 namespace bit_util {
 class BitReader;
@@ -270,7 +268,8 @@ class PARQUET_EXPORT RecordReader {
   static std::shared_ptr<RecordReader> Make(
       const ColumnDescriptor* descr, LevelInfo leaf_info,
       ::arrow::MemoryPool* pool = ::arrow::default_memory_pool(),
-      bool read_dictionary = false, bool read_dense_for_nullable = false);
+      bool read_dictionary = false, bool read_dense_for_nullable = false,
+      ::arrow::Type::type arrow_binary_type = kArrowDefaultBinaryType);
 
   virtual ~RecordReader() = default;
 
@@ -427,6 +426,8 @@ class PARQUET_EXPORT RecordReader {
   // If read_dense_for_nullable_ is true, the BinaryRecordReader/DictionaryRecordReader
   // might still populate the validity bitmap buffer.
   bool read_dense_for_nullable_ = false;
+
+  ::arrow::Type::type arrow_binary_type_ = kArrowDefaultBinaryType;
 };
 
 class BinaryRecordReader : virtual public RecordReader {

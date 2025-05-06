@@ -681,6 +681,7 @@ struct DecimalConverter<DecimalArrayType, ByteArrayType> {
   static inline Status ConvertToDecimal(const Array& array,
                                         const std::shared_ptr<DataType>& type,
                                         MemoryPool* pool, std::shared_ptr<Array>* out) {
+    // TODO does this always hold even with binary_type set to something else?
     const auto& binary_array = checked_cast<const ::arrow::BinaryArray&>(array);
     const int64_t length = binary_array.length();
 

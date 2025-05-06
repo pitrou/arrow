@@ -49,6 +49,7 @@
 #include "parquet/encoding.h"
 #include "parquet/encryption/encryption_internal.h"
 #include "parquet/encryption/internal_file_decryptor.h"
+#include "parquet/exception.h"
 #include "parquet/level_comparison.h"
 #include "parquet/level_conversion.h"
 #include "parquet/properties.h"
@@ -2069,11 +2070,35 @@ class ByteArrayChunkedRecordReader final : public TypedRecordReader<ByteArrayTyp
                                            virtual public BinaryRecordReader {
  public:
   ByteArrayChunkedRecordReader(const ColumnDescriptor* descr, LevelInfo leaf_info,
-                               ::arrow::MemoryPool* pool, bool read_dense_for_nullable)
+                               ::arrow::MemoryPool* pool, bool read_dense_for_nullable,
+                               ::arrow::Type::type arrow_binary_type)
       : TypedRecordReader<ByteArrayType>(descr, leaf_info, pool,
                                          read_dense_for_nullable) {
     ARROW_DCHECK_EQ(descr_->physical_type(), Type::BYTE_ARRAY);
-    accumulator_.builder = std::make_unique<::arrow::BinaryBuilder>(pool);
+    arrow_binary_type_ = arrow_binary_type;
+    switch (arrow_binary_type) {
+      case ::arrow::Type::BINARY:
+        accumulator_.builder = std::make_unique<::arrow::BinaryBuilder>(pool);
+        break;
+      case ::arrow::Type::STRING:
+        accumulator_.builder = std::make_unique<::arrow::StringBuilder>(pool);
+        break;
+      case ::arrow::Type::LARGE_BINARY:
+        accumulator_.builder = std::make_unique<::arrow::LargeBinaryBuilder>(pool);
+        break;
+      case ::arrow::Type::LARGE_STRING:
+        accumulator_.builder = std::make_unique<::arrow::LargeStringBuilder>(pool);
+        break;
+      case ::arrow::Type::BINARY_VIEW:
+        accumulator_.builder = std::make_unique<::arrow::BinaryViewBuilder>(pool);
+        break;
+      case ::arrow::Type::STRING_VIEW:
+        accumulator_.builder = std::make_unique<::arrow::StringViewBuilder>(pool);
+        break;
+      default:
+        throw ParquetException("cannot read Parquet BYTE_ARRAY as Arrow " +
+                               ::arrow::internal::ToString(arrow_binary_type));
+    }
   }
 
   ::arrow::ArrayVector GetBuilderChunks() override {
@@ -2116,9 +2141,15 @@ class ByteArrayDictionaryRecordReader final : public TypedRecordReader<ByteArray
                                               virtual public DictionaryRecordReader {
  public:
   ByteArrayDictionaryRecordReader(const ColumnDescriptor* descr, LevelInfo leaf_info,
-                                  ::arrow::MemoryPool* pool, bool read_dense_for_nullable)
+                                  ::arrow::MemoryPool* pool, bool read_dense_for_nullable,
+                                  ::arrow::Type::type arrow_binary_type)
       : TypedRecordReader<ByteArrayType>(descr, leaf_info, pool, read_dense_for_nullable),
         builder_(pool) {
+    if (arrow_binary_type != ::arrow::Type::BINARY) {
+      throw ParquetException(
+          "read_dictionary = true is not supported when reading as Arrow " +
+          ::arrow::internal::ToString(arrow_binary_type));
+    }
     this->read_dictionary_ = true;
   }
 
@@ -2202,17 +2233,16 @@ void TypedRecordReader<ByteArrayType>::DebugPrintState() {}
 template <>
 void TypedRecordReader<FLBAType>::DebugPrintState() {}
 
-std::shared_ptr<RecordReader> MakeByteArrayRecordReader(const ColumnDescriptor* descr,
-                                                        LevelInfo leaf_info,
-                                                        ::arrow::MemoryPool* pool,
-                                                        bool read_dictionary,
-                                                        bool read_dense_for_nullable) {
+std::shared_ptr<RecordReader> MakeByteArrayRecordReader(
+    const ColumnDescriptor* descr, LevelInfo leaf_info, ::arrow::MemoryPool* pool,
+    bool read_dictionary, bool read_dense_for_nullable,
+    ::arrow::Type::type arrow_binary_type) {
   if (read_dictionary) {
-    return std::make_shared<ByteArrayDictionaryRecordReader>(descr, leaf_info, pool,
-                                                             read_dense_for_nullable);
+    return std::make_shared<ByteArrayDictionaryRecordReader>(
+        descr, leaf_info, pool, read_dense_for_nullable, arrow_binary_type);
   } else {
-    return std::make_shared<ByteArrayChunkedRecordReader>(descr, leaf_info, pool,
-                                                          read_dense_for_nullable);
+    return std::make_shared<ByteArrayChunkedRecordReader>(
+        descr, leaf_info, pool, read_dense_for_nullable, arrow_binary_type);
   }
 }
 
@@ -2221,7 +2251,8 @@ std::shared_ptr<RecordReader> MakeByteArrayRecordReader(const ColumnDescriptor* 
 std::shared_ptr<RecordReader> RecordReader::Make(const ColumnDescriptor* descr,
                                                  LevelInfo leaf_info, MemoryPool* pool,
                                                  bool read_dictionary,
-                                                 bool read_dense_for_nullable) {
+                                                 bool read_dense_for_nullable,
+                                                 ::arrow::Type::type arrow_binary_type) {
   switch (descr->physical_type()) {
     case Type::BOOLEAN:
       return std::make_shared<TypedRecordReader<BooleanType>>(descr, leaf_info, pool,
@@ -2243,7 +2274,7 @@ std::shared_ptr<RecordReader> RecordReader::Make(const ColumnDescriptor* descr,
                                                              read_dense_for_nullable);
     case Type::BYTE_ARRAY: {
       return MakeByteArrayRecordReader(descr, leaf_info, pool, read_dictionary,
-                                       read_dense_for_nullable);
+                                       read_dense_for_nullable, arrow_binary_type);
     }
     case Type::FIXED_LEN_BYTE_ARRAY:
       return std::make_shared<FLBARecordReader>(descr, leaf_info, pool,
