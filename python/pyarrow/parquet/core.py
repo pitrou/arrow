@@ -225,6 +225,7 @@ class ParquetFile:
         If given, Parquet binary columns will be read as this datatype.
         This setting is ignored if a serialized Arrow schema is found in
         the Parquet metadata.
+    list_type : TODO
     memory_map : bool, default False
         If the source is a file path, use a memory map to read file, which can
         improve performance in some environments.
@@ -304,8 +305,9 @@ class ParquetFile:
     """
 
     def __init__(self, source, *, metadata=None, common_metadata=None,
-                 read_dictionary=None, binary_type=None, memory_map=False,
-                 buffer_size=0, pre_buffer=False, coerce_int96_timestamp_unit=None,
+                 read_dictionary=None, binary_type=None, list_type=None,
+                 memory_map=False, buffer_size=0, pre_buffer=False,
+                 coerce_int96_timestamp_unit=None,
                  decryption_properties=None, thrift_string_size_limit=None,
                  thrift_container_size_limit=None, filesystem=None,
                  page_checksum_verification=False, arrow_extensions_enabled=False):
@@ -323,7 +325,7 @@ class ParquetFile:
             source, use_memory_map=memory_map,
             buffer_size=buffer_size, pre_buffer=pre_buffer,
             read_dictionary=read_dictionary, metadata=metadata,
-            binary_type=binary_type,
+            binary_type=binary_type, list_type=list_type,
             coerce_int96_timestamp_unit=coerce_int96_timestamp_unit,
             decryption_properties=decryption_properties,
             thrift_string_size_limit=thrift_string_size_limit,
@@ -1202,6 +1204,7 @@ binary_type : pyarrow.DataType, default None
     If given, Parquet binary columns will be read as this datatype.
     This setting is ignored if a serialized Arrow schema is found in
     the Parquet metadata.
+list_type: TODO
 memory_map : bool, default False
     If the source is a file path, use a memory map to read file, which can
     improve performance in some environments.
@@ -1321,8 +1324,9 @@ Examples
 """
 
     def __init__(self, path_or_paths, filesystem=None, schema=None, *, filters=None,
-                 read_dictionary=None, binary_type=None, memory_map=False,
-                 buffer_size=None, partitioning="hive", ignore_prefixes=None,
+                 read_dictionary=None, binary_type=None, list_type=None,
+                 memory_map=False, buffer_size=None, partitioning="hive",
+                 ignore_prefixes=None,
                  pre_buffer=True, coerce_int96_timestamp_unit=None,
                  decryption_properties=None, thrift_string_size_limit=None,
                  thrift_container_size_limit=None,
@@ -1339,6 +1343,7 @@ Examples
             "page_checksum_verification": page_checksum_verification,
             "arrow_extensions_enabled": arrow_extensions_enabled,
             "binary_type": binary_type,
+            "list_type": list_type,
         }
         if buffer_size:
             read_options.update(use_buffered_stream=True,
@@ -1819,9 +1824,10 @@ Read data from a single Parquet file:
 
 def read_table(source, *, columns=None, use_threads=True,
                schema=None, use_pandas_metadata=False, read_dictionary=None,
-               binary_type=None, memory_map=False, buffer_size=0, partitioning="hive",
-               filesystem=None, filters=None, ignore_prefixes=None,
-               pre_buffer=True, coerce_int96_timestamp_unit=None,
+               binary_type=None, list_type=None, memory_map=False, buffer_size=0,
+               partitioning="hive", filesystem=None, filters=None,
+               ignore_prefixes=None, pre_buffer=True,
+               coerce_int96_timestamp_unit=None,
                decryption_properties=None, thrift_string_size_limit=None,
                thrift_container_size_limit=None,
                page_checksum_verification=False,
@@ -1836,6 +1842,7 @@ def read_table(source, *, columns=None, use_threads=True,
             memory_map=memory_map,
             read_dictionary=read_dictionary,
             binary_type=binary_type,
+            list_type=list_type,
             buffer_size=buffer_size,
             filters=filters,
             ignore_prefixes=ignore_prefixes,
@@ -1872,6 +1879,7 @@ def read_table(source, *, columns=None, use_threads=True,
         dataset = ParquetFile(
             source, read_dictionary=read_dictionary,
             binary_type=binary_type,
+            list_type=list_type,
             memory_map=memory_map, buffer_size=buffer_size,
             pre_buffer=pre_buffer,
             coerce_int96_timestamp_unit=coerce_int96_timestamp_unit,
