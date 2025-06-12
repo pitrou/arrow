@@ -621,23 +621,27 @@ template <>
 inline int PlainDecoder<FLBAType>::DecodeArrow(
     int num_values, int null_count, const uint8_t* valid_bits, int64_t valid_bits_offset,
     typename EncodingTraits<FLBAType>::Accumulator* builder) {
-  int values_decoded = num_values - null_count;
-  if (ARROW_PREDICT_FALSE(len_ < descr_->type_length() * values_decoded)) {
+  const int byte_width = descr_->type_length();
+  const int values_decoded = num_values - null_count;
+  if (ARROW_PREDICT_FALSE(len_ < byte_width * values_decoded)) {
     ParquetException::EofException();
   }
 
   PARQUET_THROW_NOT_OK(builder->Reserve(num_values));
-
-  VisitNullBitmapInline(
-      valid_bits, valid_bits_offset, num_values, null_count,
-      [&]() {
-        builder->UnsafeAppend(data_);
-        data_ += descr_->type_length();
-      },
-      [&]() { builder->UnsafeAppendNull(); });
+  PARQUET_THROW_NOT_OK(::arrow::internal::VisitBitRuns(
+      valid_bits, valid_bits_offset, num_values,
+      [&](int64_t position, int64_t run_length, bool is_valid) {
+        if (is_valid) {
+          RETURN_NOT_OK(builder->AppendValues(data_, run_length));
+          data_ += run_length * byte_width;
+        } else {
+          RETURN_NOT_OK(builder->AppendNulls(run_length));
+        }
+        return Status::OK();
+      }));
 
   num_values_ -= values_decoded;
-  len_ -= descr_->type_length() * values_decoded;
+  len_ -= byte_width * values_decoded;
   return values_decoded;
 }
 
@@ -645,23 +649,31 @@ template <>
 inline int PlainDecoder<FLBAType>::DecodeArrow(
     int num_values, int null_count, const uint8_t* valid_bits, int64_t valid_bits_offset,
     typename EncodingTraits<FLBAType>::DictAccumulator* builder) {
-  int values_decoded = num_values - null_count;
-  if (ARROW_PREDICT_FALSE(len_ < descr_->type_length() * values_decoded)) {
+  const int byte_width = descr_->type_length();
+  const int values_decoded = num_values - null_count;
+  if (ARROW_PREDICT_FALSE(len_ < byte_width * values_decoded)) {
     ParquetException::EofException();
   }
 
-  PARQUET_THROW_NOT_OK(builder->Reserve(num_values));
+  // TODO replace all other instances of VisitNullBitmapInline in this file
 
-  VisitNullBitmapInline(
-      valid_bits, valid_bits_offset, num_values, null_count,
-      [&]() {
-        PARQUET_THROW_NOT_OK(builder->Append(data_));
-        data_ += descr_->type_length();
-      },
-      [&]() { PARQUET_THROW_NOT_OK(builder->AppendNull()); });
+  PARQUET_THROW_NOT_OK(builder->Reserve(num_values));
+  PARQUET_THROW_NOT_OK(::arrow::internal::VisitBitRuns(
+      valid_bits, valid_bits_offset, num_values,
+      [&](int64_t position, int64_t run_length, bool is_valid) {
+        if (is_valid) {
+          for (int64_t i = 0; i < run_length; ++i) {
+            RETURN_NOT_OK(builder->Append(data_));
+          }
+          data_ += run_length * byte_width;
+        } else {
+          RETURN_NOT_OK(builder->AppendNulls(run_length));
+        }
+        return Status::OK();
+      }));
 
   num_values_ -= values_decoded;
-  len_ -= descr_->type_length() * values_decoded;
+  len_ -= byte_width * values_decoded;
   return values_decoded;
 }
 
@@ -2182,7 +2194,8 @@ class ByteStreamSplitDecoder : public ByteStreamSplitDecoderBase<DType> {
 
     // If null_count is 0, we could append in bulk or decode directly into
     // builder. We could also decode in chunks, or use SpacedExpand. We don't
-    // bother currently, because DecodeArrow methods are only called for ByteArray.
+    // bother currently, because DecodeArrow methods are only called for FLBA
+    // and ByteArray.
     int64_t offset = 0;
     VisitNullBitmapInline(
         valid_bits, valid_bits_offset, num_values, null_count,
@@ -2238,17 +2251,17 @@ class ByteStreamSplitDecoder<FLBAType> : public ByteStreamSplitDecoderBase<FLBAT
     const int num_decoded = this->DecodeRaw(decode_out, values_to_decode);
     DCHECK_EQ(num_decoded, values_to_decode);
 
-    // If null_count is 0, we could append in bulk or decode directly into
-    // builder. We could also decode in chunks, or use SpacedExpand. We don't
-    // bother currently, because DecodeArrow methods are only called for ByteArray.
-    int64_t offset = 0;
-    VisitNullBitmapInline(
-        valid_bits, valid_bits_offset, num_values, null_count,
-        [&]() {
-          builder->UnsafeAppend(decode_out + offset * static_cast<int64_t>(byte_width_));
-          ++offset;
-        },
-        [&]() { builder->UnsafeAppendNull(); });
+    PARQUET_THROW_NOT_OK(::arrow::internal::VisitBitRuns(
+        valid_bits, valid_bits_offset, num_values,
+        [&](int64_t position, int64_t run_length, bool is_valid) {
+          if (is_valid) {
+            RETURN_NOT_OK(builder->AppendValues(decode_out, run_length));
+            decode_out += run_length * byte_width_;
+          } else {
+            RETURN_NOT_OK(builder->AppendNulls(run_length));
+          }
+          return Status::OK();
+        }));
 
     return values_to_decode;
   }
