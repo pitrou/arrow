@@ -59,6 +59,7 @@ using arrow::VisitNullBitmapInline;
 using arrow::internal::AddWithOverflow;
 using arrow::internal::BitBlockCounter;
 using arrow::internal::checked_cast;
+using arrow::internal::VisitBitRuns;
 using arrow::util::SafeLoad;
 using arrow::util::SafeLoadAs;
 
@@ -126,6 +127,12 @@ struct ArrowBinaryHelper<ByteArrayType, ::arrow::BinaryType> {
     builder_->UnsafeAppendNull();
   }
 
+  Status AppendNulls(int64_t length) {
+    DCHECK_GE(entries_remaining_, length);
+    entries_remaining_ -= length;
+    return builder_->AppendNulls(length);
+  }
+
  private:
   Status PushChunk() {
     ARROW_ASSIGN_OR_RAISE(auto chunk, acc_->builder->Finish());
@@ -181,6 +188,8 @@ struct ArrowBinaryHelper<ByteArrayType, ArrowBinaryType> {
 
   void UnsafeAppendNull() { builder_->UnsafeAppendNull(); }
 
+  Status AppendNulls(int64_t length) { return builder_->AppendNulls(length); }
+
  private:
   BuilderType* builder_;
 };
@@ -202,6 +211,8 @@ struct ArrowBinaryHelper<FLBAType, ::arrow::FixedSizeBinaryType> {
   }
 
   void UnsafeAppendNull() { acc_->UnsafeAppendNull(); }
+
+  Status AppendNulls(int64_t length) { return acc_->AppendNulls(length); }
 
  private:
   Accumulator* acc_;
@@ -352,14 +363,18 @@ int PlainDecoder<DType>::DecodeArrow(
   }
 
   PARQUET_THROW_NOT_OK(builder->Reserve(num_values));
-
-  VisitNullBitmapInline(
-      valid_bits, valid_bits_offset, num_values, null_count,
-      [&]() {
-        builder->UnsafeAppend(SafeLoadAs<value_type>(data_));
-        data_ += sizeof(value_type);
-      },
-      [&]() { builder->UnsafeAppendNull(); });
+  PARQUET_THROW_NOT_OK(
+      VisitBitRuns(valid_bits, valid_bits_offset, num_values,
+                   [&](int64_t position, int64_t run_length, bool is_valid) {
+                     if (is_valid) {
+                       RETURN_NOT_OK(builder->AppendValues(
+                           reinterpret_cast<const value_type*>(data_), run_length));
+                       data_ += run_length * sizeof(value_type);
+                     } else {
+                       RETURN_NOT_OK(builder->AppendNulls(run_length));
+                     }
+                     return Status::OK();
+                   }));
 
   num_values_ -= values_decoded;
   len_ -= sizeof(value_type) * values_decoded;
@@ -621,23 +636,27 @@ template <>
 inline int PlainDecoder<FLBAType>::DecodeArrow(
     int num_values, int null_count, const uint8_t* valid_bits, int64_t valid_bits_offset,
     typename EncodingTraits<FLBAType>::Accumulator* builder) {
-  int values_decoded = num_values - null_count;
-  if (ARROW_PREDICT_FALSE(len_ < descr_->type_length() * values_decoded)) {
+  const int byte_width = descr_->type_length();
+  const int values_decoded = num_values - null_count;
+  if (ARROW_PREDICT_FALSE(len_ < byte_width * values_decoded)) {
     ParquetException::EofException();
   }
 
   PARQUET_THROW_NOT_OK(builder->Reserve(num_values));
-
-  VisitNullBitmapInline(
-      valid_bits, valid_bits_offset, num_values, null_count,
-      [&]() {
-        builder->UnsafeAppend(data_);
-        data_ += descr_->type_length();
-      },
-      [&]() { builder->UnsafeAppendNull(); });
+  PARQUET_THROW_NOT_OK(
+      VisitBitRuns(valid_bits, valid_bits_offset, num_values,
+                   [&](int64_t position, int64_t run_length, bool is_valid) {
+                     if (is_valid) {
+                       RETURN_NOT_OK(builder->AppendValues(data_, run_length));
+                       data_ += run_length * byte_width;
+                     } else {
+                       RETURN_NOT_OK(builder->AppendNulls(run_length));
+                     }
+                     return Status::OK();
+                   }));
 
   num_values_ -= values_decoded;
-  len_ -= descr_->type_length() * values_decoded;
+  len_ -= byte_width * values_decoded;
   return values_decoded;
 }
 
@@ -645,23 +664,29 @@ template <>
 inline int PlainDecoder<FLBAType>::DecodeArrow(
     int num_values, int null_count, const uint8_t* valid_bits, int64_t valid_bits_offset,
     typename EncodingTraits<FLBAType>::DictAccumulator* builder) {
-  int values_decoded = num_values - null_count;
-  if (ARROW_PREDICT_FALSE(len_ < descr_->type_length() * values_decoded)) {
+  const int byte_width = descr_->type_length();
+  const int values_decoded = num_values - null_count;
+  if (ARROW_PREDICT_FALSE(len_ < byte_width * values_decoded)) {
     ParquetException::EofException();
   }
 
   PARQUET_THROW_NOT_OK(builder->Reserve(num_values));
-
-  VisitNullBitmapInline(
-      valid_bits, valid_bits_offset, num_values, null_count,
-      [&]() {
-        PARQUET_THROW_NOT_OK(builder->Append(data_));
-        data_ += descr_->type_length();
-      },
-      [&]() { PARQUET_THROW_NOT_OK(builder->AppendNull()); });
+  PARQUET_THROW_NOT_OK(
+      VisitBitRuns(valid_bits, valid_bits_offset, num_values,
+                   [&](int64_t position, int64_t run_length, bool is_valid) {
+                     if (is_valid) {
+                       for (int64_t i = 0; i < run_length; ++i) {
+                         RETURN_NOT_OK(builder->Append(data_));
+                       }
+                       data_ += run_length * byte_width;
+                     } else {
+                       RETURN_NOT_OK(builder->AppendNulls(run_length));
+                     }
+                     return Status::OK();
+                   }));
 
   num_values_ -= values_decoded;
-  len_ -= descr_->type_length() * values_decoded;
+  len_ -= byte_width * values_decoded;
   return values_decoded;
 }
 
@@ -704,29 +729,32 @@ class PlainByteArrayDecoder : public PlainDecoder<ByteArrayType>,
     auto visit_binary_helper = [&](auto* helper) {
       int values_decoded = 0;
 
-      RETURN_NOT_OK(VisitNullBitmapInline(
-          valid_bits, valid_bits_offset, num_values, null_count,
-          [&]() {
-            if (ARROW_PREDICT_FALSE(len_ < 4)) {
-              return Status::Invalid(
-                  "Invalid or truncated PLAIN-encoded BYTE_ARRAY data");
+      RETURN_NOT_OK(VisitBitRuns(
+          valid_bits, valid_bits_offset, num_values,
+          [&](int64_t position, int64_t run_length, bool is_valid) {
+            if (is_valid) {
+              for (int64_t i = 0; i < run_length; ++i) {
+                if (ARROW_PREDICT_FALSE(len_ < 4)) {
+                  return Status::Invalid(
+                      "Invalid or truncated PLAIN-encoded BYTE_ARRAY data");
+                }
+                auto value_len = SafeLoadAs<int32_t>(data_);
+                if (ARROW_PREDICT_FALSE(value_len < 0 || value_len > len_ - 4)) {
+                  return Status::Invalid(
+                      "Invalid or truncated PLAIN-encoded BYTE_ARRAY data");
+                }
+                RETURN_NOT_OK(
+                    helper->AppendValue(data_ + 4, value_len,
+                                        /*estimated_remaining_data_length=*/len_));
+                auto increment = value_len + 4;
+                data_ += increment;
+                len_ -= increment;
+              }
+              values_decoded += run_length;
+              return Status::OK();
+            } else {
+              return helper->AppendNulls(run_length);
             }
-            auto value_len = SafeLoadAs<int32_t>(data_);
-            if (ARROW_PREDICT_FALSE(value_len < 0 || value_len > len_ - 4)) {
-              return Status::Invalid(
-                  "Invalid or truncated PLAIN-encoded BYTE_ARRAY data");
-            }
-            RETURN_NOT_OK(helper->AppendValue(data_ + 4, value_len,
-                                              /*estimated_remaining_data_length=*/len_));
-            auto increment = value_len + 4;
-            data_ += increment;
-            len_ -= increment;
-            ++values_decoded;
-            return Status::OK();
-          },
-          [&]() {
-            helper->UnsafeAppendNull();
-            return Status::OK();
           }));
 
       num_values_ -= values_decoded;
@@ -745,27 +773,31 @@ class PlainByteArrayDecoder : public PlainDecoder<ByteArrayType>,
     RETURN_NOT_OK(builder->Reserve(num_values));
     int values_decoded = 0;
 
-    RETURN_NOT_OK(VisitNullBitmapInline(
-        valid_bits, valid_bits_offset, num_values, null_count,
-        [&]() {
-          if (ARROW_PREDICT_FALSE(len_ < 4)) {
-            ParquetException::EofException();
+    RETURN_NOT_OK(VisitBitRuns(
+        valid_bits, valid_bits_offset, num_values,
+        [&](int64_t position, int64_t run_length, bool is_valid) {
+          if (is_valid) {
+            for (int64_t i = 0; i < run_length; ++i) {
+              if (ARROW_PREDICT_FALSE(len_ < 4)) {
+                return Status::Invalid(
+                    "Invalid or truncated PLAIN-encoded BYTE_ARRAY data");
+              }
+              auto value_len = SafeLoadAs<int32_t>(data_);
+              if (ARROW_PREDICT_FALSE(value_len < 0 || value_len > len_ - 4)) {
+                return Status::Invalid(
+                    "Invalid or truncated PLAIN-encoded BYTE_ARRAY data");
+              }
+              RETURN_NOT_OK(builder->Append(data_ + 4, value_len));
+              auto increment = value_len + 4;
+              data_ += increment;
+              len_ -= increment;
+            }
+            values_decoded += run_length;
+            return Status::OK();
+          } else {
+            return builder->AppendNulls(run_length);
           }
-          auto value_len = SafeLoadAs<int32_t>(data_);
-          if (ARROW_PREDICT_FALSE(value_len < 0 || value_len > INT32_MAX - 4)) {
-            return Status::Invalid("Invalid or corrupted value_len '", value_len, "'");
-          }
-          auto increment = value_len + 4;
-          if (ARROW_PREDICT_FALSE(len_ < increment)) {
-            ParquetException::EofException();
-          }
-          RETURN_NOT_OK(builder->Append(data_ + 4, value_len));
-          data_ += increment;
-          len_ -= increment;
-          ++values_decoded;
-          return Status::OK();
-        },
-        [&]() { return builder->AppendNull(); }));
+        }));
 
     num_values_ -= values_decoded;
     *out_values_decoded = values_decoded;
@@ -1078,18 +1110,23 @@ inline int DictDecoderImpl<FLBAType>::DecodeArrow(
   PARQUET_THROW_NOT_OK(builder->Reserve(num_values));
 
   const auto* dict_values = dictionary_->data_as<FLBA>();
-
-  VisitNullBitmapInline(
-      valid_bits, valid_bits_offset, num_values, null_count,
-      [&]() {
-        int32_t index;
-        if (ARROW_PREDICT_FALSE(!idx_decoder_.Get(&index))) {
-          throw ParquetException("");
-        }
-        PARQUET_THROW_NOT_OK(IndexInBounds(index));
-        builder->UnsafeAppend(dict_values[index].ptr);
-      },
-      [&]() { builder->UnsafeAppendNull(); });
+  PARQUET_THROW_NOT_OK(
+      VisitBitRuns(valid_bits, valid_bits_offset, num_values,
+                   [&](int64_t position, int64_t run_length, bool is_valid) {
+                     if (is_valid) {
+                       for (int64_t i = 0; i < run_length; ++i) {
+                         int32_t index;
+                         if (ARROW_PREDICT_FALSE(!idx_decoder_.Get(&index))) {
+                           return Status::Invalid("Dict decoding failed");
+                         }
+                         RETURN_NOT_OK(IndexInBounds(index));
+                         builder->UnsafeAppend(dict_values[index].ptr);
+                       }
+                       return Status::OK();
+                     } else {
+                       return builder->AppendNulls(run_length);
+                     }
+                   }));
 
   return num_values - null_count;
 }
@@ -1136,17 +1173,23 @@ int DictDecoderImpl<Type>::DecodeArrow(
   using value_type = typename Type::c_type;
   const auto* dict_values = dictionary_->data_as<value_type>();
 
-  VisitNullBitmapInline(
-      valid_bits, valid_bits_offset, num_values, null_count,
-      [&]() {
-        int32_t index;
-        if (ARROW_PREDICT_FALSE(!idx_decoder_.Get(&index))) {
-          throw ParquetException("");
-        }
-        PARQUET_THROW_NOT_OK(IndexInBounds(index));
-        builder->UnsafeAppend(dict_values[index]);
-      },
-      [&]() { builder->UnsafeAppendNull(); });
+  PARQUET_THROW_NOT_OK(
+      VisitBitRuns(valid_bits, valid_bits_offset, num_values,
+                   [&](int64_t position, int64_t run_length, bool is_valid) {
+                     if (is_valid) {
+                       for (int64_t i = 0; i < run_length; ++i) {
+                         int32_t index;
+                         if (ARROW_PREDICT_FALSE(!idx_decoder_.Get(&index))) {
+                           return Status::Invalid("Dict decoding failed");
+                         }
+                         RETURN_NOT_OK(IndexInBounds(index));
+                         builder->UnsafeAppend(dict_values[index]);
+                       }
+                       return Status::OK();
+                     } else {
+                       return builder->AppendNulls(run_length);
+                     }
+                   }));
 
   return num_values - null_count;
 }
@@ -1246,8 +1289,8 @@ class DictByteArrayDecoderImpl : public DictDecoderImpl<ByteArrayType>,
         return Status::OK();
       };
 
-      RETURN_NOT_OK(::arrow::internal::VisitBitRuns(valid_bits, valid_bits_offset,
-                                                    num_values, visit_bit_run));
+      RETURN_NOT_OK(
+          VisitBitRuns(valid_bits, valid_bits_offset, num_values, visit_bit_run));
       *out_num_values = values_decoded;
       return Status::OK();
     };
@@ -1679,32 +1722,32 @@ class DeltaLengthByteArrayDecoder : public DecoderImpl,
                           int64_t valid_bits_offset,
                           typename EncodingTraits<ByteArrayType>::Accumulator* out,
                           int* out_num_values) {
-    auto visit_binary_helper = [&](auto* helper) {
-      std::vector<ByteArray> values(num_values - null_count);
-      const int num_valid_values = Decode(values.data(), num_values - null_count);
-      if (ARROW_PREDICT_FALSE(num_values - null_count != num_valid_values)) {
-        throw ParquetException("Expected to decode ", num_values - null_count,
-                               " values, but decoded ", num_valid_values, " values.");
-      }
+    std::vector<ByteArray> values(num_values - null_count);
+    const int num_valid_values = Decode(values.data(), num_values - null_count);
+    if (ARROW_PREDICT_FALSE(num_values - null_count != num_valid_values)) {
+      throw ParquetException("Expected to decode ", num_values - null_count,
+                             " values, but decoded ", num_valid_values, " values.");
+    }
 
+    auto visit_binary_helper = [&](auto* helper) {
       auto values_ptr = values.data();
       int value_idx = 0;
 
-      RETURN_NOT_OK(VisitNullBitmapInline(
-          valid_bits, valid_bits_offset, num_values, null_count,
-          [&]() {
-            const auto& val = values_ptr[value_idx];
-            RETURN_NOT_OK(helper->AppendValue(val.ptr, static_cast<int32_t>(val.len)));
-            ++value_idx;
-            return Status::OK();
-          },
-          [&]() {
-            helper->UnsafeAppendNull();
-            --null_count;
-            return Status::OK();
-          }));
-
-      DCHECK_EQ(null_count, 0);
+      RETURN_NOT_OK(
+          VisitBitRuns(valid_bits, valid_bits_offset, num_values,
+                       [&](int64_t position, int64_t run_length, bool is_valid) {
+                         if (is_valid) {
+                           for (int64_t i = 0; i < run_length; ++i) {
+                             const auto& val = values_ptr[value_idx];
+                             RETURN_NOT_OK(helper->AppendValue(
+                                 val.ptr, static_cast<int32_t>(val.len)));
+                             ++value_idx;
+                           }
+                           return Status::OK();
+                         } else {
+                           return helper->AppendNulls(run_length);
+                         }
+                       }));
       *out_num_values = num_valid_values;
       return Status::OK();
     };
@@ -2005,29 +2048,30 @@ class DeltaByteArrayDecoderImpl : public DecoderImpl, public TypedDecoderImpl<DT
                           int64_t valid_bits_offset,
                           typename EncodingTraits<DType>::Accumulator* out,
                           int* out_num_values) {
-    auto visit_binary_helper = [&](auto* helper) {
-      std::vector<ByteArray> values(num_values);
-      const int num_valid_values = GetInternal(values.data(), num_values - null_count);
-      DCHECK_EQ(num_values - null_count, num_valid_values);
+    std::vector<ByteArray> values(num_values);
+    const int num_valid_values = GetInternal(values.data(), num_values - null_count);
+    DCHECK_EQ(num_values - null_count, num_valid_values);
 
+    auto visit_binary_helper = [&](auto* helper) {
       auto values_ptr = reinterpret_cast<const ByteArray*>(values.data());
       int value_idx = 0;
 
-      RETURN_NOT_OK(VisitNullBitmapInline(
-          valid_bits, valid_bits_offset, num_values, null_count,
-          [&]() {
-            const auto& val = values_ptr[value_idx];
-            RETURN_NOT_OK(helper->AppendValue(val.ptr, static_cast<int32_t>(val.len)));
-            ++value_idx;
-            return Status::OK();
-          },
-          [&]() {
-            helper->UnsafeAppendNull();
-            --null_count;
-            return Status::OK();
-          }));
+      PARQUET_THROW_NOT_OK(
+          VisitBitRuns(valid_bits, valid_bits_offset, num_values,
+                       [&](int64_t position, int64_t run_length, bool is_valid) {
+                         if (is_valid) {
+                           for (int64_t i = 0; i < run_length; ++i) {
+                             const auto& val = values_ptr[value_idx];
+                             RETURN_NOT_OK(helper->AppendValue(
+                                 val.ptr, static_cast<int32_t>(val.len)));
+                             ++value_idx;
+                           }
+                           return Status::OK();
+                         } else {
+                           return helper->AppendNulls(run_length);
+                         }
+                       }));
 
-      DCHECK_EQ(null_count, 0);
       *out_num_values = num_valid_values;
       return Status::OK();
     };
@@ -2182,15 +2226,20 @@ class ByteStreamSplitDecoder : public ByteStreamSplitDecoderBase<DType> {
 
     // If null_count is 0, we could append in bulk or decode directly into
     // builder. We could also decode in chunks, or use SpacedExpand. We don't
-    // bother currently, because DecodeArrow methods are only called for ByteArray.
+    // bother currently, because DecodeArrow methods are only called for FLBA
+    // and ByteArray.
     int64_t offset = 0;
-    VisitNullBitmapInline(
-        valid_bits, valid_bits_offset, num_values, null_count,
-        [&]() {
-          builder->UnsafeAppend(decode_out[offset]);
-          ++offset;
-        },
-        [&]() { builder->UnsafeAppendNull(); });
+    PARQUET_THROW_NOT_OK(VisitBitRuns(
+        valid_bits, valid_bits_offset, num_values,
+        [&](int64_t position, int64_t run_length, bool is_valid) {
+          if (is_valid) {
+            RETURN_NOT_OK(builder->AppendValues(decode_out + offset, run_length));
+            decode_out += run_length;
+            return Status::OK();
+          } else {
+            return builder->AppendNulls(run_length);
+          }
+        }));
 
     return values_to_decode;
   }
@@ -2238,17 +2287,20 @@ class ByteStreamSplitDecoder<FLBAType> : public ByteStreamSplitDecoderBase<FLBAT
     const int num_decoded = this->DecodeRaw(decode_out, values_to_decode);
     DCHECK_EQ(num_decoded, values_to_decode);
 
-    // If null_count is 0, we could append in bulk or decode directly into
-    // builder. We could also decode in chunks, or use SpacedExpand. We don't
-    // bother currently, because DecodeArrow methods are only called for ByteArray.
-    int64_t offset = 0;
-    VisitNullBitmapInline(
-        valid_bits, valid_bits_offset, num_values, null_count,
-        [&]() {
-          builder->UnsafeAppend(decode_out + offset * static_cast<int64_t>(byte_width_));
-          ++offset;
-        },
-        [&]() { builder->UnsafeAppendNull(); });
+    // TODO: If null_count is 0, we could append in bulk or decode directly into
+    // builder. We could also decode in chunks, or use SpacedExpand.
+    // (TODO: add benchmarks for both cases?)
+    PARQUET_THROW_NOT_OK(
+        VisitBitRuns(valid_bits, valid_bits_offset, num_values,
+                     [&](int64_t position, int64_t run_length, bool is_valid) {
+                       if (is_valid) {
+                         RETURN_NOT_OK(builder->AppendValues(decode_out, run_length));
+                         decode_out += run_length * byte_width_;
+                       } else {
+                         RETURN_NOT_OK(builder->AppendNulls(run_length));
+                       }
+                       return Status::OK();
+                     }));
 
     return values_to_decode;
   }
