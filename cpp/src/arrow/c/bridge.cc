@@ -681,17 +681,22 @@ struct ArrayExporter {
 
 }  // namespace
 
-Status ExportArray(const Array& array, struct ArrowArray* out,
+Status ExportArray(std::shared_ptr<ArrayData> array, struct ArrowArray* out,
                    struct ArrowSchema* out_schema) {
   SchemaExportGuard guard(out_schema);
   if (out_schema != nullptr) {
-    RETURN_NOT_OK(ExportType(*array.type(), out_schema));
+    RETURN_NOT_OK(ExportType(*array->type, out_schema));
   }
   ArrayExporter exporter;
-  RETURN_NOT_OK(exporter.Export(array.data()));
+  RETURN_NOT_OK(exporter.Export(std::move(array)));
   exporter.Finish(out);
   guard.Detach();
   return Status::OK();
+}
+
+Status ExportArray(const Array& array, struct ArrowArray* out,
+                   struct ArrowSchema* out_schema) {
+  return ExportArray(array.data(), out, out_schema);
 }
 
 Status ExportRecordBatch(const RecordBatch& batch, struct ArrowArray* out,

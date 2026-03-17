@@ -73,6 +73,12 @@ ARROW_EXPORT
 Status ExportArray(const Array& array, struct ArrowArray* out,
                    struct ArrowSchema* out_schema = NULLPTR);
 
+// TODO docstring
+// XXX rename this ExportArrayData? We might want ImportArrayData at some point.
+ARROW_EXPORT
+Status ExportArray(std::shared_ptr<ArrayData> array, struct ArrowArray* out,
+                   struct ArrowSchema* out_schema = NULLPTR);
+
 /// \brief Export C++ RecordBatch using the C data interface format.
 ///
 /// The record batch is exported as if it were a struct array.

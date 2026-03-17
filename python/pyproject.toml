@@ -58,6 +58,9 @@ Documentation = "https://arrow.apache.org/docs/python"
 Repository = "https://github.com/apache/arrow"
 Issues = "https://github.com/apache/arrow/issues"
 
+[project.entry-points.numba_extensions]
+init = "pyarrow.numba:_register"
+
 [dependency-groups]
 test = [
     'pytest',

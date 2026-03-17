@@ -395,6 +395,7 @@ set(PYARROW_CPP_SRCS
     ${PYARROW_CPP_SOURCE_DIR}/inference.cc
     ${PYARROW_CPP_SOURCE_DIR}/io.cc
     ${PYARROW_CPP_SOURCE_DIR}/ipc.cc
+    ${PYARROW_CPP_SOURCE_DIR}/numba.cc
     ${PYARROW_CPP_SOURCE_DIR}/numpy_convert.cc
     ${PYARROW_CPP_SOURCE_DIR}/numpy_init.cc
     ${PYARROW_CPP_SOURCE_DIR}/numpy_to_arrow.cc
