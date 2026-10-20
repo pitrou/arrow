@@ -1065,9 +1065,24 @@ int64_t InitializeV1Levels(const DataPageV1& page, auto& def_dec, auto& rep_dec)
   }
 
   if (const auto max_def_lvl = def_dec.max_level(); max_def_lvl > 0) {
+    std::optional<int16_t> unique_level;
+    if (max_def_lvl == 1) {
+      const auto& page_stats = page.statistics();
+      if (page_stats.has_null_count) {
+        if (page_stats.null_count == 0) {
+          // XXX Can we generalize this to `max_def_level > 1`?
+          unique_level = 1;
+        } else if (page_stats.null_count == num_values) {
+          unique_level = 0;
+        }
+      }
+    }
+    // Not using page.size_statistics() as they are left uninitialized by the reader.
     const int32_t def_levels_bytes =
         def_dec.SetDataV1(page.definition_level_encoding(), buffer, max_size,
-                          {.value_count = num_values, .max_level = max_def_lvl});
+                          {.value_count = num_values,
+                           .max_level = max_def_lvl,
+                           .unique_level = unique_level});
     levels_byte_size += def_levels_bytes;
     max_size -= def_levels_bytes;
   }
@@ -1102,8 +1117,20 @@ int64_t InitializeV2Levels(const DataPageV2& page, auto& def_dec, auto& rep_dec)
   buffer += page.repetition_levels_byte_length();
 
   if (const auto max_def_lvl = def_dec.max_level(); max_def_lvl > 0) {
+    std::optional<int16_t> unique_level;
+    if (max_def_lvl == 1) {
+      if (page.num_nulls() == 0) {
+        // XXX Can we generalize this to `max_def_level > 1`?
+        unique_level = 1;
+      } else if (page.num_nulls() == num_values) {
+        unique_level = 0;
+      }
+    }
+    // Not using page.size_statistics() as they are left uninitialized by the reader.
     def_dec.SetDataV2(buffer, page.definition_levels_byte_length(),
-                      {.value_count = num_values, .max_level = max_def_lvl});
+                      {.value_count = num_values,
+                       .max_level = max_def_lvl,
+                       .unique_level = unique_level});
   }
 
   return total_levels_length;

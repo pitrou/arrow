@@ -17,7 +17,9 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <sstream>
 #include <variant>
 
@@ -37,6 +39,7 @@ namespace parquet {
 struct LevelDecoderParams {
   int32_t value_count = 0;
   int16_t max_level = 0;
+  std::optional<int16_t> unique_level = {};
 };
 
 /*******************************
@@ -165,6 +168,7 @@ class PageLevelDecoder {
   /// up to a multiple of 8 so it cannot know the exact number of remaining values.
   int32_t num_values_remaining_ = 0;
   int16_t max_level_ = 0;
+  std::optional<int16_t> unique_level_ = {};
 };
 
 /// Decoder for definition levels that writes directly into a validity bitmap.
@@ -205,6 +209,19 @@ inline void CheckLevelMinMax(const int16_t* data, int32_t size, int16_t max_leve
   }
 }
 
+inline int32_t DecodeUniform(int16_t* out, int16_t value, int32_t num_values) {
+  std::fill_n(out, num_values, value);
+  return num_values;
+}
+
+inline int32_t DecodeUniform(::arrow::util::BitmapSpanMut out, int16_t value,
+                             int32_t num_values) {
+  ARROW_DCHECK(value == 0 || value == 1);
+  ::arrow::bit_util::SetBitsTo(out.data(), out.bit_start(), num_values,
+                               /*bits_are_set=*/(value != 0));
+  return num_values;
+}
+
 /*************************************************
  *  Implementation of PageLevelDecoder Adapters  *
  *************************************************/
@@ -238,6 +255,7 @@ int32_t PageLevelDecoder<BitDec, RleDec>::SetDataV1(Encoding::type encoding,
 
   num_values_remaining_ = params.value_count;
   max_level_ = params.max_level;
+  unique_level_ = params.unique_level;
   const int32_t value_bit_width = Log2(params.max_level + 1);
 
   switch (encoding) {
@@ -279,6 +297,7 @@ void PageLevelDecoder<BitDec, RleDec>::SetDataV2(const uint8_t* data, int32_t da
   }
   num_values_remaining_ = params.value_count;
   max_level_ = params.max_level;
+  unique_level_ = params.unique_level;
   decoder_ = RleDec(data, data_size, params);
 }
 
@@ -286,32 +305,50 @@ template <typename BitDec, typename RleDec>
 template <typename Out>
 int32_t PageLevelDecoder<BitDec, RleDec>::Decode(Out&& out, int32_t batch_size) {
   const int32_t num_values = std::min(num_values_remaining_, batch_size);
-  const int32_t num_decoded = std::visit(
-      [&](auto& dec) { return dec.GetBatch(out, num_values, max_level_); }, decoder_);
-  num_values_remaining_ -= num_decoded;
-  return num_decoded;
+  if (unique_level_.has_value()) {
+    num_values_remaining_ -= num_values;
+    return DecodeUniform(out, unique_level_.value(), num_values);
+  } else {
+    const int32_t num_decoded = std::visit(
+        [&](auto& dec) { return dec.GetBatch(out, num_values, max_level_); }, decoder_);
+    num_values_remaining_ -= num_decoded;
+    return num_decoded;
+  }
 }
 
 template <typename BitDec, typename RleDec>
 int32_t PageLevelDecoder<BitDec, RleDec>::Skip(int32_t batch_size) {
   const int32_t num_values = std::min(num_values_remaining_, batch_size);
-  const int32_t num_advanced =
-      std::visit([&](auto& dec) { return dec.Advance(num_values); }, decoder_);
-  num_values_remaining_ -= num_advanced;
-  return num_advanced;
+  if (unique_level_.has_value()) {
+    num_values_remaining_ -= num_values;
+    return num_values;
+  } else {
+    const int32_t num_advanced =
+        std::visit([&](auto& dec) { return dec.Advance(num_values); }, decoder_);
+    num_values_remaining_ -= num_advanced;
+    return num_advanced;
+  }
 }
 
 template <typename BitDec, typename RleDec>
 auto PageLevelDecoder<BitDec, RleDec>::CountUpTo(int16_t value,
                                                  int32_t batch_size) -> CountUpToResult {
   const int32_t num_values = std::min(num_values_remaining_, batch_size);
-  const auto result =
-      std::visit([&](auto& dec) { return dec.CountUpTo(value, num_values); }, decoder_);
-  num_values_remaining_ -= result.processed_count;
-  return {
-      .matching_count = result.matching_count,
-      .processed_count = result.processed_count,
-  };
+  if (unique_level_.has_value()) {
+    num_values_remaining_ -= num_values;
+    return {
+        .matching_count = (value == unique_level_.value()) ? num_values : 0,
+        .processed_count = num_values,
+    };
+  } else {
+    const auto result =
+        std::visit([&](auto& dec) { return dec.CountUpTo(value, num_values); }, decoder_);
+    num_values_remaining_ -= result.processed_count;
+    return {
+        .matching_count = result.matching_count,
+        .processed_count = result.processed_count,
+    };
+  }
 }
 
 }  // namespace parquet
