@@ -290,7 +290,8 @@ std::shared_ptr<FileMetaData> ConstructFakeMetaData(
       col_chunk.__set_offset_index_length(
           static_cast<int32_t>(page_index_ranges.offset_index_length));
     }
-    row_group.columns.push_back(col_chunk);
+    row_group.columns.push_back(
+        std::make_unique<format::ColumnChunk>(std::move(col_chunk)));
   }
 
   format::FileMetaData metadata;
@@ -309,7 +310,8 @@ std::shared_ptr<FileMetaData> ConstructFakeMetaData(
   auto sink = CreateOutputStream();
   ThriftSerializer{}.Serialize(&metadata, sink.get());
   auto buffer = sink->Finish().MoveValueUnsafe();
-  return FileMetaData::Make(buffer->data(), buffer->size());
+  auto file_metadata = FileMetaData::Make(std::move(buffer));
+  return file_metadata;
 }
 
 /// Validates that 'DeterminePageIndexRangesInRowGroup()' selects the expected file
@@ -937,8 +939,8 @@ TEST_F(PageIndexBuilderTest, TwoRowGroups) {
   WritePageIndexes(num_row_groups, num_columns, page_stats, page_locations,
                    final_position);
 
-  // Verify that all columns have good column indexes except the 2nd column in the 2nd row
-  // group.
+  // Verify that all columns have good column indexes except the 2nd column in the 2nd
+  // row group.
   CheckColumnIndex(/*row_group=*/0, /*column=*/0, page_stats[0][0]);
   CheckColumnIndex(/*row_group=*/0, /*column=*/1, page_stats[0][1]);
   CheckColumnIndex(/*row_group=*/1, /*column=*/1, page_stats[1][1]);

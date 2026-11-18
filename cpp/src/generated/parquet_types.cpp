@@ -78,12 +78,12 @@ int _kConvertedTypeValues[] = {
   ConvertedType::ENUM,
   /**
    * A decimal value.
-   * 
+   *
    * This may be used to annotate BYTE_ARRAY or FIXED_LEN_BYTE_ARRAY primitive
    * types. The underlying byte array stores the unscaled value encoded as two's
    * complement using big-endian byte order (the most significant byte is the
    * zeroth element). The value of the decimal is the value * 10^{-scale}.
-   * 
+   *
    * This must be accompanied by a (maximum) precision and a scale in the
    * SchemaElement. The precision specifies the number of digits in the decimal
    * and the scale stores the location of the decimal point. For example 1.23
@@ -93,47 +93,47 @@ int _kConvertedTypeValues[] = {
   ConvertedType::DECIMAL,
   /**
    * A Date
-   * 
+   *
    * Stored as days since Unix epoch, encoded as the INT32 physical type.
-   * 
+   *
    */
   ConvertedType::DATE,
   /**
    * A time
-   * 
+   *
    * The total number of milliseconds since midnight.  The value is stored
    * as an INT32 physical type.
    */
   ConvertedType::TIME_MILLIS,
   /**
    * A time.
-   * 
+   *
    * The total number of microseconds since midnight.  The value is stored as
    * an INT64 physical type.
    */
   ConvertedType::TIME_MICROS,
   /**
    * A date/time combination
-   * 
+   *
    * Date and time recorded as milliseconds since the Unix epoch.  Recorded as
    * a physical type of INT64.
    */
   ConvertedType::TIMESTAMP_MILLIS,
   /**
    * A date/time combination
-   * 
+   *
    * Date and time recorded as microseconds since the Unix epoch.  The value is
    * stored as an INT64 physical type.
    */
   ConvertedType::TIMESTAMP_MICROS,
   /**
    * An unsigned integer value.
-   * 
+   *
    * The number describes the maximum number of meaningful data bits in
    * the stored value. 8, 16 and 32 bit values are stored using the
    * INT32 physical type.  64 bit values are stored using the INT64
    * physical type.
-   * 
+   *
    */
   ConvertedType::UINT_8,
   ConvertedType::UINT_16,
@@ -141,12 +141,12 @@ int _kConvertedTypeValues[] = {
   ConvertedType::UINT_64,
   /**
    * A signed integer value.
-   * 
+   *
    * The number describes the maximum number of meaningful data bits in
    * the stored value. 8, 16 and 32 bit values are stored using the
    * INT32 physical type.  64 bit values are stored using the INT64
    * physical type.
-   * 
+   *
    */
   ConvertedType::INT_8,
   ConvertedType::INT_16,
@@ -154,19 +154,19 @@ int _kConvertedTypeValues[] = {
   ConvertedType::INT_64,
   /**
    * An embedded JSON document
-   * 
+   *
    * A JSON document embedded within a single UTF8 column.
    */
   ConvertedType::JSON,
   /**
    * An embedded BSON document
-   * 
+   *
    * A BSON document embedded within a single BYTE_ARRAY column.
    */
   ConvertedType::BSON,
   /**
    * An interval of time
-   * 
+   *
    * This type annotates data stored as a FIXED_LEN_BYTE_ARRAY of length 12
    * This data is composed of three separate little endian unsigned
    * integers.  Each stores a component of a duration of time.  The first
@@ -202,12 +202,12 @@ const char* _kConvertedTypeNames[] = {
   "ENUM",
   /**
    * A decimal value.
-   * 
+   *
    * This may be used to annotate BYTE_ARRAY or FIXED_LEN_BYTE_ARRAY primitive
    * types. The underlying byte array stores the unscaled value encoded as two's
    * complement using big-endian byte order (the most significant byte is the
    * zeroth element). The value of the decimal is the value * 10^{-scale}.
-   * 
+   *
    * This must be accompanied by a (maximum) precision and a scale in the
    * SchemaElement. The precision specifies the number of digits in the decimal
    * and the scale stores the location of the decimal point. For example 1.23
@@ -217,47 +217,47 @@ const char* _kConvertedTypeNames[] = {
   "DECIMAL",
   /**
    * A Date
-   * 
+   *
    * Stored as days since Unix epoch, encoded as the INT32 physical type.
-   * 
+   *
    */
   "DATE",
   /**
    * A time
-   * 
+   *
    * The total number of milliseconds since midnight.  The value is stored
    * as an INT32 physical type.
    */
   "TIME_MILLIS",
   /**
    * A time.
-   * 
+   *
    * The total number of microseconds since midnight.  The value is stored as
    * an INT64 physical type.
    */
   "TIME_MICROS",
   /**
    * A date/time combination
-   * 
+   *
    * Date and time recorded as milliseconds since the Unix epoch.  Recorded as
    * a physical type of INT64.
    */
   "TIMESTAMP_MILLIS",
   /**
    * A date/time combination
-   * 
+   *
    * Date and time recorded as microseconds since the Unix epoch.  The value is
    * stored as an INT64 physical type.
    */
   "TIMESTAMP_MICROS",
   /**
    * An unsigned integer value.
-   * 
+   *
    * The number describes the maximum number of meaningful data bits in
    * the stored value. 8, 16 and 32 bit values are stored using the
    * INT32 physical type.  64 bit values are stored using the INT64
    * physical type.
-   * 
+   *
    */
   "UINT_8",
   "UINT_16",
@@ -265,12 +265,12 @@ const char* _kConvertedTypeNames[] = {
   "UINT_64",
   /**
    * A signed integer value.
-   * 
+   *
    * The number describes the maximum number of meaningful data bits in
    * the stored value. 8, 16 and 32 bit values are stored using the
    * INT32 physical type.  64 bit values are stored using the INT64
    * physical type.
-   * 
+   *
    */
   "INT_8",
   "INT_16",
@@ -278,19 +278,19 @@ const char* _kConvertedTypeNames[] = {
   "INT_64",
   /**
    * An embedded JSON document
-   * 
+   *
    * A JSON document embedded within a single UTF8 column.
    */
   "JSON",
   /**
    * An embedded BSON document
-   * 
+   *
    * A BSON document embedded within a single BYTE_ARRAY column.
    */
   "BSON",
   /**
    * An interval of time
-   * 
+   *
    * This type annotates data stored as a FIXED_LEN_BYTE_ARRAY of length 12
    * This data is composed of three separate little endian unsigned
    * integers.  Each stores a component of a duration of time.  The first
@@ -463,7 +463,7 @@ int _kEncodingValues[] = {
    * the streams are concatenated.
    * This itself does not reduce the size of the data but can lead to better compression
    * afterwards.
-   * 
+   *
    * Added in 2.8 for FLOAT and DOUBLE.
    * Support for INT32, INT64 and FIXED_LEN_BYTE_ARRAY added in 2.11.
    */
@@ -533,7 +533,7 @@ const char* _kEncodingNames[] = {
    * the streams are concatenated.
    * This itself does not reduce the size of the data but can lead to better compression
    * afterwards.
-   * 
+   *
    * Added in 2.8 for FLOAT and DOUBLE.
    * Support for INT32, INT64 and FIXED_LEN_BYTE_ARRAY added in 2.11.
    */
@@ -4678,8 +4678,12 @@ RowGroup::RowGroup() noexcept
      ordinal(0) {
 }
 
-void RowGroup::__set_columns(const std::vector<ColumnChunk> & val) {
-  this->columns = val;
+void RowGroup::__set_columns(const std::vector<ColumnChunk>& val) {
+  this->columns.resize(val.size());
+  for (size_t i = 0; i < val.size(); ++i) {
+    // this->columns[i] = val[i];
+    this->columns[i] = std::make_unique<ColumnChunk>(val[i]);
+  }
 }
 
 void RowGroup::__set_total_byte_size(const int64_t val) {
@@ -4730,7 +4734,7 @@ void swap(RowGroup &a, RowGroup &b) noexcept {
 
 bool RowGroup::operator==(const RowGroup & rhs) const
 {
-  if (!(columns == rhs.columns))
+  if (!(columns.size() == rhs.columns.size()))
     return false;
   if (!(total_byte_size == rhs.total_byte_size))
     return false;
@@ -4755,8 +4759,20 @@ bool RowGroup::operator==(const RowGroup & rhs) const
   return true;
 }
 
+static inline RowGroup::LazyColumnChunk CopyColumnChunk(
+    const RowGroup::LazyColumnChunk& c) {
+  if (c.index() == 0) {
+    return {std::get<0>(c)};
+  } else {
+    return {std::make_unique<ColumnChunk>(*std::get<1>(c))};
+  }
+}
+
 RowGroup::RowGroup(const RowGroup& other267) {
-  columns = other267.columns;
+  columns.resize(other267.columns.size());
+  std::transform(other267.columns.begin(), other267.columns.end(), columns.begin(),
+                 CopyColumnChunk);
+  // columns = other267.columns;
   total_byte_size = other267.total_byte_size;
   num_rows = other267.num_rows;
   sorting_columns = other267.sorting_columns;
@@ -4776,7 +4792,10 @@ RowGroup::RowGroup(RowGroup&& other268) noexcept {
   __isset = other268.__isset;
 }
 RowGroup& RowGroup::operator=(const RowGroup& other269) {
-  columns = other269.columns;
+  columns.resize(other269.columns.size());
+  std::transform(other269.columns.begin(), other269.columns.end(), columns.begin(),
+                 CopyColumnChunk);
+  // columns = other269.columns;
   total_byte_size = other269.total_byte_size;
   num_rows = other269.num_rows;
   sorting_columns = other269.sorting_columns;
@@ -4800,7 +4819,7 @@ RowGroup& RowGroup::operator=(RowGroup&& other270) noexcept {
 void RowGroup::printTo(std::ostream& out) const {
   using ::apache::thrift::to_string;
   out << "RowGroup(";
-  out << "columns=" << to_string(columns);
+  // out << "columns=" << to_string(columns);
   out << ", " << "total_byte_size=" << to_string(total_byte_size);
   out << ", " << "num_rows=" << to_string(num_rows);
   out << ", " << "sorting_columns="; (__isset.sorting_columns ? (out << to_string(sorting_columns)) : (out << "<null>"));

@@ -25,11 +25,14 @@
 #include <string>
 #include <vector>
 
+#include "arrow/type_fwd.h"
+
 #include "parquet/encryption/type_fwd.h"
 #include "parquet/index_location.h"
 #include "parquet/platform.h"
 #include "parquet/properties.h"
 #include "parquet/type_fwd.h"
+
 namespace parquet {
 
 using KeyValueMetadata = ::arrow::KeyValueMetadata;
@@ -256,6 +259,11 @@ class PARQUET_EXPORT FileMetaData {
       const ReaderProperties& properties = default_reader_properties(),
       std::shared_ptr<InternalFileDecryptor> file_decryptor = NULLPTR);
 
+  static std::shared_ptr<FileMetaData> Make(
+      std::shared_ptr<::arrow::Buffer> serialized_metadata,
+      const ReaderProperties& properties = default_reader_properties(),
+      std::shared_ptr<InternalFileDecryptor> file_decryptor = NULLPTR);
+
   ~FileMetaData();
 
   bool Equals(const FileMetaData& other) const;
@@ -388,6 +396,10 @@ class PARQUET_EXPORT FileMetaData {
 
   explicit FileMetaData(ReaderProperties properties);
   FileMetaData(const void* serialized_metadata, int64_t metadata_len,
+               const ReaderProperties& properties,
+               std::shared_ptr<InternalFileDecryptor> file_decryptor = NULLPTR);
+
+  FileMetaData(std::shared_ptr<::arrow::Buffer> serialized_metadata,
                const ReaderProperties& properties,
                std::shared_ptr<InternalFileDecryptor> file_decryptor = NULLPTR);
 

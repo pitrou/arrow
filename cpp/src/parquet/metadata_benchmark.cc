@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <cmath>
 #include <memory>
 #include <sstream>
 
@@ -92,7 +93,7 @@ class MetadataBenchmark {
     return buf;
   }
 
-  void ReadFile(std::shared_ptr<Buffer> contents) {
+  void ReadFile(std::shared_ptr<Buffer> contents, int percent_selected = 0) {
     auto source = std::make_shared<BufferReader>(contents);
     ReaderProperties props;
     auto reader = ParquetFileReader::Open(source, props);
@@ -101,6 +102,15 @@ class MetadataBenchmark {
     ARROW_CHECK_EQ(metadata->num_row_groups(), num_row_groups_);
     // There should be one row per row group
     ARROW_CHECK_EQ(metadata->num_rows(), num_row_groups_);
+    // Force column metadata materialization for the selected columns
+    int num_selected_columns =
+        static_cast<int>(std::ceil(num_columns_ * percent_selected / 100.0));
+    for (int rg = 0; rg < num_row_groups_; ++rg) {
+      auto row_group_metadata = metadata->RowGroup(rg);
+      for (int i = 0; i < num_selected_columns; ++i) {
+        row_group_metadata->ColumnChunk(i);
+      }
+    }
     reader->Close();
   }
 
@@ -131,6 +141,18 @@ void ReadMetadataSetArgs(benchmark::internal::Benchmark* bench) {
   WriteMetadataSetArgs(bench);
 }
 
+void ReadColumnMetadataSetArgs(benchmark::internal::Benchmark* bench) {
+  bench->ArgNames({"num_columns", "num_row_groups", "percent_selected"});
+
+  for (int num_columns : {10, 100, 1000}) {
+    for (int num_row_groups : {1, 100}) {
+      for (int percent_selected : {0, 5, 100}) {
+        bench->Args({num_columns, num_row_groups, percent_selected});
+      }
+    }
+  }
+}
+
 void WriteFileMetadataAndData(benchmark::State& state) {
   MetadataBenchmark benchmark(&state);
 
@@ -150,7 +172,18 @@ void ReadFileMetadata(benchmark::State& state) {
   state.SetItemsProcessed(state.iterations());
 }
 
+void ReadFileAndColumnMetadata(benchmark::State& state) {
+  MetadataBenchmark benchmark(&state);
+  auto contents = benchmark.WriteFile(&state);
+
+  for (auto _ : state) {
+    benchmark.ReadFile(contents, /*percent_selected=*/static_cast<int>(state.range(2)));
+  }
+  state.SetItemsProcessed(state.iterations());
+}
+
 BENCHMARK(WriteFileMetadataAndData)->Apply(WriteMetadataSetArgs);
 BENCHMARK(ReadFileMetadata)->Apply(ReadMetadataSetArgs);
+BENCHMARK(ReadFileAndColumnMetadata)->Apply(ReadColumnMetadataSetArgs);
 
 }  // namespace parquet

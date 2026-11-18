@@ -7,6 +7,12 @@
 #ifndef parquet_TYPES_TCC
 #define parquet_TYPES_TCC
 
+#include <array>
+#include <iostream>
+#include <span>
+
+#include <thrift/transport/TBufferTransports.h>
+
 #include "parquet_types.h"
 
 namespace parquet { namespace format {
@@ -4106,6 +4112,382 @@ uint32_t ColumnChunk::write(Protocol_* oprot) const {
   return xfer;
 }
 
+namespace {
+
+using ::apache::thrift::protocol::TProtocolException;
+using ::apache::thrift::protocol::TType;
+
+// XXX copied from TCompactProtocol.tcc
+enum CompactType {
+  CT_STOP = 0x00,
+  CT_BOOLEAN_TRUE = 0x01,
+  CT_BOOLEAN_FALSE = 0x02,
+  CT_BYTE = 0x03,
+  CT_I16 = 0x04,
+  CT_I32 = 0x05,
+  CT_I64 = 0x06,
+  CT_DOUBLE = 0x07,
+  CT_BINARY = 0x08,
+  CT_LIST = 0x09,
+  CT_SET = 0x0A,
+  CT_MAP = 0x0B,
+  CT_STRUCT = 0x0C,
+  CT_UUID = 0x0D
+};
+
+constexpr int8_t kMaxCompactType = CompactType::CT_UUID + 1;
+
+// XXX copied from TCompactProtocol.tcc
+const int8_t TTypeToCType[17] = {
+    CT_STOP,          // T_STOP
+    0,                // unused
+    CT_BOOLEAN_TRUE,  // T_BOOL
+    CT_BYTE,          // T_BYTE
+    CT_DOUBLE,        // T_DOUBLE
+    0,                // unused
+    CT_I16,           // T_I16
+    0,                // unused
+    CT_I32,           // T_I32
+    0,                // unused
+    CT_I64,           // T_I64
+    CT_BINARY,        // T_STRING
+    CT_STRUCT,        // T_STRUCT
+    CT_MAP,           // T_MAP
+    CT_SET,           // T_SET
+    CT_LIST,          // T_LIST
+    CT_UUID,          // T_UUID
+};
+
+inline __attribute__((always_inline)) const uint8_t* ReadByte(const uint8_t* buf,
+                                                              const uint8_t* end,
+                                                              uint8_t* byte) {
+  if (buf == end) {
+    throw TProtocolException(TProtocolException::INVALID_DATA, "EOF");
+  }
+  *byte = *buf++;
+  return buf;
+}
+
+template <typename Int>
+inline const uint8_t* ReadVarIntSlow(const uint8_t* buf, const uint8_t* end,
+                                     Int* out_value) {
+  constexpr uint32_t kMaxBytes = (sizeof(Int) * 8 + 7) / 7;
+
+  auto len = static_cast<uint32_t>(end - buf);
+  len = (len < kMaxBytes) ? len : kMaxBytes;
+  uint64_t value = 0;
+  int shift = 0;
+
+  while (len-- > 0) {
+    uint8_t byte = *buf++;
+    value |= static_cast<uint64_t>(byte & 0x7f) << shift;
+    if (!(byte & 0x80)) {
+      *out_value = static_cast<Int>(value);
+      return buf;
+    }
+  }
+  throw TProtocolException(TProtocolException::INVALID_DATA,
+                           "Variable-length int too long");
+}
+
+template <typename Int>
+inline __attribute__((always_inline)) const uint8_t* ReadVarInt(const uint8_t* buf,
+                                                                const uint8_t* end,
+                                                                Int* out_value) {
+  auto len = static_cast<uint32_t>(end - buf);
+  if (len >= 3) [[likely]] {
+    if (!(buf[0] & 0x80)) {
+      *out_value = buf[0];
+      return buf + 1;
+    }
+    if (!(buf[1] & 0x80)) {
+      *out_value = (buf[0] & 0x7f) + (buf[1] << 7);
+      return buf + 2;
+    }
+    if (!(buf[2] & 0x80)) {
+      *out_value = (buf[0] & 0x7f) + ((buf[1] & 0x7f) << 7) + (buf[2] << 14);
+      return buf + 2;
+    }
+    if constexpr (sizeof(Int) <= 2) {
+      return buf + 3;
+    }
+  }
+  return ReadVarIntSlow(buf, end, out_value);
+}
+
+template <int kBytes>
+inline __attribute__((always_inline)) const uint8_t* SkipVarInt(const uint8_t* buf,
+                                                                const uint8_t* end) {
+  while (buf < end) {
+    uint8_t byte = *buf++;
+    if (!(byte & 0x80)) {
+      return buf;
+    }
+  }
+  throw TProtocolException(TProtocolException::INVALID_DATA,
+                           "Incomplete variable-length int");
+}
+
+struct SkipFieldResult {
+  int8_t compact_type;
+};
+
+inline __attribute__((always_inline)) const uint8_t* SkipFieldBegin(
+    const uint8_t* buf, const uint8_t* end, SkipFieldResult* result) {
+  uint8_t byte;
+  buf = ReadByte(buf, end, &byte);
+  int8_t type = static_cast<int8_t>(byte & 0x0f);
+  *result = {type};
+
+  // The 4 MSB of the type header can contain a delta field id, but if 0
+  // the field id is encoded separately.
+  if ((byte & 0xf0) == 0 && type != CompactType::CT_STOP) [[unlikely]] {
+    // Not a delta, skip the varint-encoded field id.
+    return SkipVarInt<2>(buf, end);
+  } else {
+    return buf;
+  }
+}
+
+struct ReadListResult {
+  int8_t compact_type;
+  uint32_t size;
+};
+
+inline __attribute__((always_inline)) const uint8_t* ReadListBegin(
+    const uint8_t* buf, const uint8_t* end, ReadListResult* result) {
+  uint8_t size_and_type;
+  buf = ReadByte(buf, end, &size_and_type);
+
+  int8_t type = static_cast<int8_t>(size_and_type & 0x0f);
+  uint32_t list_size = (size_and_type >> 4) & 0x0f;
+  if (list_size == 15) {
+    buf = ReadVarInt(buf, end, &list_size);
+  }
+  *result = {type, list_size};
+  return buf;
+}
+
+#define DEBUG_SKIP 0
+
+constexpr inline bool IsTerminalCompactType(int8_t ctype) {
+  return ctype > CT_STOP && ctype <= CT_BINARY;
+}
+
+inline __attribute__((always_inline)) const uint8_t* SkipFieldTerminal(const uint8_t* buf,
+                                                                       const uint8_t* end,
+                                                                       int8_t ctype) {
+#if DEBUG_SKIP
+  std::cerr << "  terminal type: " << static_cast<int>(ctype) << std::endl;
+#endif
+  switch (ctype) {
+    case CT_STOP:
+    case CT_BOOLEAN_TRUE:
+    case CT_BOOLEAN_FALSE:
+      return buf;
+    case CT_BYTE:
+      if (buf == end) {
+        throw TProtocolException(TProtocolException::INVALID_DATA, "EOF after CT_BYTE");
+      }
+      return buf + 1;
+    case CT_I16:
+    case CT_I32:
+    case CT_I64:
+      while (buf < end) {
+        if (!(*buf++ & 0x80)) {
+          return buf;
+        }
+      }
+      throw TProtocolException(TProtocolException::INVALID_DATA,
+                               "Incomplete variable-length int");
+    case CT_DOUBLE: {
+      if (end - buf < 8) {
+        throw TProtocolException(TProtocolException::INVALID_DATA, "EOF after CT_DOUBLE");
+      }
+      return buf + 8;
+    }
+    case CT_BINARY: {
+      uint32_t binary_size;
+      buf = ReadVarInt(buf, end, &binary_size);
+      if (end - buf < binary_size) {
+        throw TProtocolException(TProtocolException::INVALID_DATA, "EOF after CT_DOUBLE");
+      }
+      return buf + binary_size;
+    }
+    default:
+      __builtin_unreachable();
+      return 0;
+  }
+}
+
+inline const uint8_t* SkipFieldTerminals(const uint8_t* buf, const uint8_t* end,
+                                         int8_t ctype, uint32_t size) {
+  switch (ctype) {
+    case CT_STOP:
+      return 0;
+    case CT_BOOLEAN_TRUE:
+    case CT_BOOLEAN_FALSE:
+    case CT_BYTE:
+      if (end - buf < size) {
+        throw TProtocolException(TProtocolException::INVALID_DATA, "EOF after CT_BYTE");
+      }
+      return buf + size;
+    case CT_I16:
+    case CT_I32:
+    case CT_I64: {
+      while (size > 0) {
+        if (buf == end) {
+          throw TProtocolException(TProtocolException::INVALID_DATA, "EOF after CT_INT*");
+        }
+        size -= !(*buf++ & 0x80);
+      }
+      return buf;
+    }
+    case CT_DOUBLE: {
+      if (end - buf < 8 * size) {
+        throw TProtocolException(TProtocolException::INVALID_DATA, "EOF after CT_BYTE");
+      }
+      return buf + 8 * size;
+    }
+    case CT_BINARY: {
+      for (uint32_t i = 0; i < size; ++i) {
+        uint32_t binary_size;
+        buf = ReadVarInt(buf, end, &binary_size);
+        if (end - buf < binary_size) {
+          throw TProtocolException(TProtocolException::INVALID_DATA, "EOF after CT_BYTE");
+        }
+        buf += binary_size;
+      }
+      return buf;
+    }
+    default:
+      __builtin_unreachable();
+      return 0;
+  }
+}
+
+inline const uint8_t* SkipListOfStructCompact(const uint8_t* buf, const uint8_t* end,
+                                              uint32_t expected_structs) {
+  // List of structs: iterate over struct fields.
+  // This function never recurses.
+  while (true) {
+    SkipFieldResult skip_result;
+    buf = SkipFieldBegin(buf, end, &skip_result);
+    if (IsTerminalCompactType(skip_result.compact_type)) {
+      buf = SkipFieldTerminal(buf, end, skip_result.compact_type);
+    } else if (skip_result.compact_type == CT_STOP) {
+      if (--expected_structs == 0) {
+        break;
+      }
+    } else if (skip_result.compact_type == CT_STRUCT) {
+      // We can handle a nested struct inline by adjusting our expectations
+      // about the number of CT_STOPs.
+      ++expected_structs;
+    } else if (skip_result.compact_type == CT_LIST) {
+      ReadListResult list_result;
+      buf = ReadListBegin(buf, end, &list_result);
+      if (list_result.size != 0) {
+        if (IsTerminalCompactType(list_result.compact_type)) {
+          // Inline fast path for list of terminals
+          buf = SkipFieldTerminals(buf, end, list_result.compact_type, list_result.size);
+        } else if (list_result.compact_type == CT_STRUCT) {
+          // XXX Is this correct?
+          expected_structs += list_result.size;
+        } else {
+          // Parquet only has lists of terminals and lists of structs
+          throw TProtocolException(TProtocolException::INVALID_DATA,
+                                   "Unexpected Thrift list type");
+        }
+      }
+    } else {
+      throw TProtocolException(TProtocolException::INVALID_DATA,
+                               "Unexpected Thrift struct type");
+    }
+  }
+  return buf;
+}
+
+inline const uint8_t* SkipStructCompact(const uint8_t* buf, const uint8_t* end) {
+  return SkipListOfStructCompact(buf, end, /*expected_structs=*/1);
+}
+
+inline const uint8_t* SkipListCompact(const uint8_t* buf, const uint8_t* end) {
+  ReadListResult skip_result;
+  buf = ReadListBegin(buf, end, &skip_result);
+#if DEBUG_SKIP
+  std::cerr << "<list size = " << skip_result.size << " >\n";
+#endif
+  if (skip_result.size == 0) {
+    return buf;
+  }
+  if (IsTerminalCompactType(skip_result.compact_type)) {
+    // Fast path for list of terminals
+    return SkipFieldTerminals(buf, end, skip_result.compact_type, skip_result.size);
+  } else if (skip_result.compact_type == CT_STRUCT) {
+    // List of structs: iterate over struct fields, avoiding recursion if
+    // only terminals are present.
+    return SkipListOfStructCompact(buf, end, skip_result.size);
+  } else {
+    // No list<list> in Parquet
+    throw TProtocolException(TProtocolException::INVALID_DATA,
+                             "unexpected Thrift list type");
+  }
+#if DEBUG_SKIP
+  std::cerr << "</list>\n";
+#endif
+}
+
+inline const uint8_t* SkipFieldCompact(const uint8_t* buf, const uint8_t* end,
+                                       int8_t ctype) {
+  assert(!IsTerminalCompactType(ctype));
+
+  switch (ctype) {
+    case CT_STRUCT: {
+      return SkipStructCompact(buf, end);
+    }
+    case CT_LIST: {
+      return SkipListCompact(buf, end);
+    }
+    default:
+      throw TProtocolException(TProtocolException::INVALID_DATA, "invalid TType");
+  }
+}
+
+template <class Transport_>
+std::span<const uint8_t> SkipField(Transport_* trans, TType ttype) {
+  if (ttype < 0 || ttype >= sizeof(TTypeToCType)) {
+    throw TProtocolException(TProtocolException::INVALID_DATA, "invalid TType");
+  }
+
+  uint32_t thrift_buf_size = 1;
+  const uint8_t* thrift_buf = trans->borrow(nullptr, &thrift_buf_size);
+  assert(thrift_buf != nullptr);
+
+  const auto ctype = TTypeToCType[ttype];
+  const uint8_t* thrift_skip_end =
+      SkipFieldCompact(thrift_buf, thrift_buf + thrift_buf_size, ctype);
+  assert(thrift_skip_end - thrift_buf <= thrift_buf_size);
+
+  return std::span{thrift_buf, thrift_skip_end};
+}
+
+}  // namespace
+
+enum class ColumnChunkMode {
+  // Eager decode
+  Decode,
+  // Lazy decode
+  Skip,
+  // Eager decode, but also check skipping jumps by the the same amount of bytes
+  SkipAndDecode
+};
+
+#ifdef NDEBUG
+static constexpr auto kColumnChunkMode = ColumnChunkMode::Skip;
+#else
+static constexpr auto kColumnChunkMode = ColumnChunkMode::Skip;
+#endif
+
 template <class Protocol_>
 uint32_t RowGroup::read(Protocol_* iprot) {
 
@@ -4135,14 +4517,31 @@ uint32_t RowGroup::read(Protocol_* iprot) {
         if (ftype == ::apache::thrift::protocol::T_LIST) {
           {
             this->columns.clear();
+            auto trans = dynamic_cast<::apache::thrift::transport::TMemoryBuffer*>(
+                iprot->getInputTransport().get());
             uint32_t _size255;
             ::apache::thrift::protocol::TType _etype258;
             xfer += iprot->readListBegin(_etype258, _size255);
             this->columns.resize(_size255);
             uint32_t _i259;
-            for (_i259 = 0; _i259 < _size255; ++_i259)
-            {
-              xfer += this->columns[_i259].read(iprot);
+            for (_i259 = 0; _i259 < _size255; ++_i259) {
+              uint32_t xfer_before = xfer;
+              std::span<const uint8_t> skipped;
+              (void)skipped;
+              if constexpr (kColumnChunkMode != ColumnChunkMode::Decode) {
+                skipped = SkipField(trans, _etype258);
+              }
+              if constexpr (kColumnChunkMode == ColumnChunkMode::Skip) {
+                this->columns[_i259] = skipped;
+                xfer += static_cast<uint32_t>(skipped.size());
+                trans->consume(xfer - xfer_before);
+              } else {
+                this->columns[_i259] = std::make_unique<ColumnChunk>();
+                xfer += std::get<1>(this->columns[_i259])->read(iprot);
+                if constexpr (kColumnChunkMode == ColumnChunkMode::SkipAndDecode) {
+                  assert(xfer - xfer_before == skipped.size());
+                }
+              }
             }
             xfer += iprot->readListEnd();
           }
@@ -4238,10 +4637,9 @@ uint32_t RowGroup::write(Protocol_* oprot) const {
   xfer += oprot->writeFieldBegin("columns", ::apache::thrift::protocol::T_LIST, 1);
   {
     xfer += oprot->writeListBegin(::apache::thrift::protocol::T_STRUCT, static_cast<uint32_t>(this->columns.size()));
-    std::vector<ColumnChunk> ::const_iterator _iter265;
-    for (_iter265 = this->columns.begin(); _iter265 != this->columns.end(); ++_iter265)
+    for (auto _iter265 = this->columns.begin(); _iter265 != this->columns.end(); ++_iter265)
     {
-      xfer += (*_iter265).write(oprot);
+      xfer += std::get<1>(*_iter265)->write(oprot);
     }
     xfer += oprot->writeListEnd();
   }

@@ -656,6 +656,8 @@ class ThriftDeserializer {
       ss << "Couldn't deserialize thrift: " << e.what() << "\n";
       throw ParquetException(ss.str());
     }
+    // ARROW_LOG(INFO) << "Serialized message size: "
+    //                 << len - static_cast<int64_t>(tmem_transport->available_read());
     return len - static_cast<int64_t>(tmem_transport->available_read());
   }
 

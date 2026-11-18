@@ -301,9 +301,10 @@ format::FileMetaData SingleInt32MetadataWithStats() {
   fields.back()->ToParquet(&leaf);
   metadata.schema = {std::move(root), std::move(leaf)};
 
-  auto& column = metadata.row_groups.emplace_back().columns.emplace_back();
-  column.__isset.meta_data = true;
-  auto& column_metadata = column.meta_data;
+  auto& column = std::get<1>(metadata.row_groups.emplace_back().columns.emplace_back(
+      std::make_unique<format::ColumnChunk>()));
+  column->__isset.meta_data = true;
+  auto& column_metadata = column->meta_data;
   column_metadata.__set_type(format::Type::INT32);
   column_metadata.__isset.statistics = true;
   auto& statistics = column_metadata.statistics;
@@ -352,12 +353,14 @@ TEST(Metadata, UnknownCompressionCodecThrows) {
   format::FileMetaData thrift_metadata = SingleInt32MetadataWithStats();
   auto metadata = ParseMetadata(SerializeMetadata(thrift_metadata));
 
-  auto& column_chunk = thrift_metadata.row_groups.at(0).columns.at(0);
+  auto& column_chunk = std::get<1>(thrift_metadata.row_groups.at(0).columns.at(0));
+  ASSERT_TRUE(column_chunk);
   const int32_t raw_codec = 8;
-  static_assert(sizeof(column_chunk.meta_data.codec) == sizeof(raw_codec));
-  std::memcpy(&column_chunk.meta_data.codec, &raw_codec, sizeof(raw_codec));
+  static_assert(sizeof(column_chunk->meta_data.codec) == sizeof(raw_codec));
+  std::memcpy(&column_chunk->meta_data.codec, &raw_codec, sizeof(raw_codec));
 
-  auto column = ColumnChunkMetaData::Make(&column_chunk, metadata->schema()->Column(0));
+  auto column =
+      ColumnChunkMetaData::Make(column_chunk.get(), metadata->schema()->Column(0));
 
   EXPECT_THROW_THAT([&]() { column->compression(); }, ParquetException,
                     ::testing::Property(
@@ -373,7 +376,8 @@ TEST(Metadata, UnknownColumnOrderIgnoresMinMax) {
   thrift_metadata.column_orders.emplace_back();
   thrift_metadata.__isset.column_orders = true;
 
-  auto metadata = ParseMetadata(SerializeMetadata(thrift_metadata));
+  auto encoded_metadata = SerializeMetadata(thrift_metadata);
+  auto metadata = ParseMetadata(encoded_metadata);
   AssertColumnChunkHasNoMinMax(*metadata, ColumnOrder::UNKNOWN);
 }
 
@@ -381,11 +385,13 @@ TEST(Metadata, MissingColumnOrderUsesLegacyMinMax) {
   format::FileMetaData thrift_metadata = SingleInt32MetadataWithStats();
   thrift_metadata.column_orders.clear();
   thrift_metadata.__isset.column_orders = false;
-  auto& statistics = thrift_metadata.row_groups.at(0).columns.at(0).meta_data.statistics;
+  auto& statistics =
+      std::get<1>(thrift_metadata.row_groups.at(0).columns.at(0))->meta_data.statistics;
   statistics.__set_min_value(EncodeInt32(kLegacyMin - 100));
   statistics.__set_max_value(EncodeInt32(kLegacyMax + 100));
 
-  auto metadata = ParseMetadata(SerializeMetadata(thrift_metadata));
+  auto encoded_metadata = SerializeMetadata(thrift_metadata);
+  auto metadata = ParseMetadata(encoded_metadata);
   AssertColumnChunkMinMax(*metadata, ColumnOrder::UNDEFINED, kLegacyMin, kLegacyMax);
 }
 
@@ -552,7 +558,7 @@ TEST(Metadata, TestSortingColumns) {
   std::vector<SortingColumn> sorting_columns;
   {
     SortingColumn sorting_column;
-    sorting_column.column_idx = 0;
+    sorting_column.column_idx = 42;
     sorting_column.descending = false;
     sorting_column.nulls_first = false;
     sorting_columns.push_back(sorting_column);

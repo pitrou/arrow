@@ -654,10 +654,9 @@ int64_t SerializedFile::ParseUnencryptedFileMetadata(
                            std::to_string(metadata_len) + " bytes but got " +
                            std::to_string(metadata_buffer->size()) + " bytes)");
   }
-  int64_t read_metadata_len = metadata_len;
   // The encrypted read path falls through to here, so pass in the decryptor
-  file_metadata_ = FileMetaData::Make(metadata_buffer->data(), read_metadata_len,
-                                      properties_, std::move(file_decryptor));
+  file_metadata_ =
+      FileMetaData::Make(metadata_buffer, properties_, std::move(file_decryptor));
   return file_metadata_->size();
 }
 
