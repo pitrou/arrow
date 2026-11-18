@@ -552,7 +552,7 @@ TEST(Metadata, TestSortingColumns) {
   std::vector<SortingColumn> sorting_columns;
   {
     SortingColumn sorting_column;
-    sorting_column.column_idx = 0;
+    sorting_column.column_idx = 42;
     sorting_column.descending = false;
     sorting_column.nulls_first = false;
     sorting_columns.push_back(sorting_column);

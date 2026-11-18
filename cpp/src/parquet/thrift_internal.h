@@ -647,15 +647,17 @@ class ThriftDeserializer {
     auto tmem_transport = CreateReadOnlyMemoryBuffer(const_cast<uint8_t*>(buf), len);
     auto tproto = apache::thrift::protocol::TCompactProtocolT<ThriftBuffer>(
         tmem_transport, string_size_limit_, container_size_limit_);
-    try {
-      deserialized_msg
-          ->template read<apache::thrift::protocol::TCompactProtocolT<ThriftBuffer>>(
-              &tproto);
-    } catch (std::exception& e) {
-      std::stringstream ss;
-      ss << "Couldn't deserialize thrift: " << e.what() << "\n";
-      throw ParquetException(ss.str());
-    }
+    // try {
+    deserialized_msg
+        ->template read<apache::thrift::protocol::TCompactProtocolT<ThriftBuffer>>(
+            &tproto);
+    // } catch (std::exception& e) {
+    //   std::stringstream ss;
+    //   ss << "Couldn't deserialize thrift: " << e.what() << "\n";
+    //   throw ParquetException(ss.str());
+    // }
+    // ARROW_LOG(INFO) << "Serialized message size: "
+    //                 << len - static_cast<int64_t>(tmem_transport->available_read());
     return len - static_cast<int64_t>(tmem_transport->available_read());
   }
 
